@@ -349,6 +349,18 @@ router.get('/area-codes', auth, checkPermission('viewAnalytics'), async (req, re
       { $project: { _id: 0, areaCode: 1, totalCalls: 1 } }
     ];
 
+    // Search filtering (after grouping)
+    if (req.query.search) {
+      pipeline.push({
+        $match: {
+          $or: [
+            { areaCode: { $regex: req.query.search, $options: 'i' } },
+            { state: { $regex: req.query.search, $options: 'i' } }
+          ]
+        }
+      });
+    }
+
     // Add sorting
     const sortObj = {};
     sortObj[sortBy] = sortOrder === 'asc' ? 1 : -1;
