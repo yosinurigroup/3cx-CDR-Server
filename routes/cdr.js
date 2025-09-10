@@ -274,48 +274,79 @@ router.get('/area-codes', auth, checkPermission('viewAnalytics'), async (req, re
     // Get the appropriate CDR model based on collection parameter
     const CDR = getCDRModel(collection);
 
-    // Aggregate area codes with statistics
+    // Robust aggregation: derive outgoing calls and area code from raw fields
     const pipeline = [
-      {
-        $match: {
-          areaCode: { $exists: true, $ne: null, $ne: '' }
-        }
-      },
-      {
-        $group: {
-          _id: '$areaCode',
-          totalCalls: { $sum: 1 },
-          answeredCalls: {
-            $sum: { $cond: [{ $eq: ['$status', 'answered'] }, 1, 0] }
-          },
-          totalDuration: { $sum: '$durationSeconds' },
-          totalCost: { $sum: '$cost' },
-          avgDuration: { $avg: '$durationSeconds' }
-        }
-      },
+      // Derive fields from raw CDR document
       {
         $addFields: {
-          areaCode: '$_id',
-          answerRate: {
-            $multiply: [
-              { $divide: ['$answeredCalls', '$totalCalls'] },
-              100
-            ]
+          fromNumberRaw: { $ifNull: ["$from-no", ""] },
+          toNumberRaw: { $ifNull: ["$to-no", ""] }
+        }
+      },
+      // Determine callType using from-no heuristic
+      {
+        $addFields: {
+          callType: {
+            $cond: {
+              if: { $regexMatch: { input: "$fromNumberRaw", regex: /^Ext\./ } },
+              then: "outgoing",
+              else: {
+                $cond: {
+                  if: { $regexMatch: { input: "$fromNumberRaw", regex: /^\+?\d/ } },
+                  then: "incoming",
+                  else: "outgoing"
+                }
+              }
+            }
+          }
+        }
+      },
+      // Only outgoing
+      { $match: { callType: "outgoing" } },
+      // Clean destination number and extract 3-digit area code
+      {
+        $addFields: {
+          cleanTo: {
+            $replaceAll: {
+              input: {
+                $replaceAll: {
+                  input: {
+                    $replaceAll: { input: { $toString: "$toNumberRaw" }, find: "+", replacement: "" }
+                  },
+                  find: " ", replacement: ""
+                }
+              },
+              find: "-", replacement: ""
+            }
           }
         }
       },
       {
-        $project: {
-          _id: 0,
-          areaCode: 1,
-          totalCalls: 1,
-          answeredCalls: 1,
-          totalDuration: 1,
-          totalCost: { $round: ['$totalCost', 2] },
-          avgDuration: { $round: ['$avgDuration', 0] },
-          answerRate: { $round: ['$answerRate', 2] }
+        $addFields: {
+          extractedAreaCode: {
+            $cond: {
+              if: { $gte: [{ $strLenCP: "$cleanTo" }, 3] },
+              then: {
+                $cond: {
+                  if: { $eq: [{ $substr: ["$cleanTo", 0, 1] }, "1"] },
+                  then: { $substr: ["$cleanTo", 1, 3] },
+                  else: { $substr: ["$cleanTo", 0, 3] }
+                }
+              },
+              else: { $ifNull: ["$areaCode", null] }
+            }
+          }
         }
-      }
+      },
+      { $match: { extractedAreaCode: { $ne: null, $ne: "" } } },
+      {
+        $group: {
+          _id: "$extractedAreaCode",
+          totalCalls: { $sum: 1 }
+        }
+      },
+      { $addFields: { areaCode: "$_id" } },
+      { $project: { _id: 0, areaCode: 1, totalCalls: 1 } }
     ];
 
     // Add sorting
@@ -342,6 +373,7 @@ router.get('/area-codes', auth, checkPermission('viewAnalytics'), async (req, re
     const paginatedResults = areaCodesWithPercentage.slice(skip, skip + parseInt(limit));
 
     res.json({
+      success: true,
       areaCodes: paginatedResults,
       pagination: {
         currentPage: parseInt(page),
