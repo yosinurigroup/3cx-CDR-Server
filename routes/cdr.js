@@ -529,112 +529,80 @@ router.get('/area-codes', auth, checkPermission('viewCallLogs'), async (req, res
 
     console.log('🔍 Match conditions:', JSON.stringify(matchConditions, null, 2));
 
-    // Simplified aggregation pipeline
+    // Robust aggregation pipeline that derives fields from raw CDR columns
     const pipeline = [
-      { $match: matchConditions },
+      // Derive fields from raw CDR document
       {
         $addFields: {
-          // Extract area code from destination number (toNumber for outgoing calls)
-          extractedAreaCode: {
-            $let: {
-              vars: {
-                // Clean the phone number (remove +1, spaces, dashes, etc.)
-                cleanNumber: {
-                  $regexReplace: {
-                    input: { $toString: "$toNumber" },
-                    regex: /[\+\-\s\(\)]/g,
-                    replacement: ""
-                  }
-                }
-              },
-              in: {
+          fromNumberRaw: { $ifNull: ["$from-no", ""] },
+          toNumberRaw: { $ifNull: ["$to-no", ""] }
+        }
+      },
+      // Determine callType using from-no heuristic
+      {
+        $addFields: {
+          callType: {
+            $cond: {
+              if: { $regexMatch: { input: "$fromNumberRaw", regex: /^Ext\./ } },
+              then: "outgoing",
+              else: {
                 $cond: {
-                  if: { $gte: [{ $strLenCP: "$$cleanNumber" }, 10] },
-                  then: {
-                    $cond: {
-                      if: { $eq: [{ $substr: ["$$cleanNumber", 0, 1] }, "1"] },
-                      // If starts with 1, take next 3 digits (US/Canada format)
-                      then: { $substr: ["$$cleanNumber", 1, 3] },
-                      // Otherwise take first 3 digits
-                      else: { $substr: ["$$cleanNumber", 0, 3] }
-                    }
-                  },
-                  else: {
-                    // Fallback to existing areaCode field
-                    $ifNull: ["$areaCode", null]
-                  }
+                  if: { $regexMatch: { input: "$fromNumberRaw", regex: /^\+?\d/ } },
+                  then: "incoming",
+                  else: "outgoing"
                 }
               }
             }
           }
         }
       },
-      {
-        $match: {
-          extractedAreaCode: { $ne: null, $exists: true, $ne: "" }
-        }
-      },
-      {
-        $group: {
-          _id: "$extractedAreaCode",
-          totalCalls: { $sum: 1 },
-          answeredCalls: {
-            $sum: {
-              $cond: [
-                { $in: ["$status", ["answered", "completed"]] },
-                1, 0
-              ]
-            }
-          },
-          totalDuration: { $sum: { $ifNull: ["$durationSeconds", 0] } },
-          totalCost: { $sum: { $toDouble: { $ifNull: ["$cost", 0] } } }
-        }
-      },
+      // Only outgoing
+      { $match: { callType: "outgoing" } },
+      // Clean destination number and extract 3-digit area code
       {
         $addFields: {
-          areaCode: "$_id",
-          answerRate: {
-            $cond: {
-              if: { $gt: ["$totalCalls", 0] },
-              then: {
-                $multiply: [
-                  { $divide: ["$answeredCalls", "$totalCalls"] },
-                  100
-                ]
+          cleanTo: {
+            $replaceAll: {
+              input: {
+                $replaceAll: {
+                  input: {
+                    $replaceAll: { input: { $toString: "$toNumberRaw" }, find: "+", replacement: "" }
+                  },
+                  find: " ", replacement: ""
+                }
               },
-              else: 0
-            }
-          },
-          avgDuration: {
-            $cond: {
-              if: { $gt: ["$answeredCalls", 0] },
-              then: { $divide: ["$totalDuration", "$answeredCalls"] },
-              else: 0
-            }
-          },
-          // Enhanced state mapping for North American area codes
-          state: {
-            $switch: {
-              branches: [
-                // California
-                { case: { $in: ["$_id", ["213", "323", "424", "661", "747", "818", "310", "562", "626", "714", "760", "805", "831", "858", "909", "916", "925", "949", "951"]] }, then: "California" },
-                // New York 
-                { case: { $in: ["$_id", ["212", "646", "917", "718", "347", "929", "516", "631", "845", "914"]] }, then: "New York" },
-                // Florida
-                { case: { $in: ["$_id", ["305", "786", "954", "561", "407", "321", "727", "813", "850", "863", "904", "941", "239"]] }, then: "Florida" },
-                // Texas
-                { case: { $in: ["$_id", ["214", "469", "972", "945", "713", "281", "832", "409", "430", "903", "940", "979"]] }, then: "Texas" },
-                // Illinois
-                { case: { $in: ["$_id", ["312", "773", "872", "630", "708", "847", "224"]] }, then: "Illinois" },
-                // Special case for your example: 92
-                { case: { $eq: ["$_id", "92"] }, then: "California" }
-              ],
-              default: "Unknown"
+              find: "-", replacement: ""
             }
           }
         }
       },
-      { $project: { _id: 0 } }
+      {
+        $addFields: {
+          extractedAreaCode: {
+            $cond: {
+              if: { $gte: [{ $strLenCP: "$cleanTo" }, 3] },
+              then: {
+                $cond: {
+                  if: { $eq: [{ $substr: ["$cleanTo", 0, 1] }, "1"] },
+                  then: { $substr: ["$cleanTo", 1, 3] },
+                  else: { $substr: ["$cleanTo", 0, 3] }
+                }
+              },
+              else: { $ifNull: ["$areaCode", null] }
+            }
+          }
+        }
+      },
+      { $match: { extractedAreaCode: { $ne: null, $ne: "" } } },
+      {
+        $group: {
+          _id: "$extractedAreaCode",
+          totalCalls: { $sum: 1 }
+        }
+      },
+      { $addFields: { areaCode: "$_id" } },
+      { $project: { _id: 0, areaCode: 1, totalCalls: 1 } },
+      { $sort: { totalCalls: -1 } }
     ];
 
     // Search filtering (after grouping)
