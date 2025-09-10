@@ -269,84 +269,72 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
 // @access  Private
 router.get('/area-codes', auth, checkPermission('viewAnalytics'), async (req, res) => {
   try {
-    const { page = 1, limit = 50, sortBy = 'totalCalls', sortOrder = 'desc', collection } = req.query;
+    const { page = 1, limit = 50, sortBy = 'totalCalls', sortOrder = 'desc', collection, dateFrom, dateTo, callType, status } = req.query;
 
     // Get the appropriate CDR model based on collection parameter
     const CDR = getCDRModel(collection);
 
-    // Robust aggregation: derive outgoing calls and area code from raw fields
+    // Align logic with analytics /area-code-distribution for consistency
     const pipeline = [
-      // Derive fields from raw CDR document
+      // Optional date filtering (match analytics behavior)
       {
-        $addFields: {
-          fromNumberRaw: { $ifNull: ["$from-no", ""] },
-          toNumberRaw: { $ifNull: ["$to-no", ""] }
-        }
+        $match: (() => {
+          const q = {};
+          if (dateFrom || dateTo) {
+            q['time-start'] = {};
+            if (dateFrom) q['time-start'].$gte = new Date(dateFrom);
+            if (dateTo) q['time-start'].$lte = new Date(dateTo);
+          }
+          return q;
+        })()
       },
-      // Determine callType using from-no heuristic
       {
         $addFields: {
           callType: {
             $cond: {
-              if: { $regexMatch: { input: "$fromNumberRaw", regex: /^Ext\./ } },
-              then: "outgoing",
+              if: { $regexMatch: { input: '$from-no', regex: /^Ext\./ } },
+              then: 'outgoing',
               else: {
                 $cond: {
-                  if: { $regexMatch: { input: "$fromNumberRaw", regex: /^\+?\d/ } },
-                  then: "incoming",
-                  else: "outgoing"
+                  if: { $regexMatch: { input: '$from-no', regex: /^\+?\d/ } },
+                  then: 'incoming',
+                  else: 'outgoing'
                 }
               }
             }
-          }
-        }
-      },
-      // Only outgoing
-      { $match: { callType: "outgoing" } },
-      // Clean destination number and extract 3-digit area code
-      {
-        $addFields: {
-          cleanTo: {
-            $replaceAll: {
-              input: {
-                $replaceAll: {
-                  input: {
-                    $replaceAll: { input: { $toString: "$toNumberRaw" }, find: "+", replacement: "" }
-                  },
-                  find: " ", replacement: ""
-                }
-              },
-              find: "-", replacement: ""
-            }
-          }
-        }
-      },
-      {
-        $addFields: {
-          extractedAreaCode: {
+          },
+          areaCode: {
             $cond: {
-              if: { $gte: [{ $strLenCP: "$cleanTo" }, 3] },
+              if: { $regexMatch: { input: '$from-no', regex: /^Ext\./ } },
               then: {
-                $cond: {
-                  if: { $eq: [{ $substr: ["$cleanTo", 0, 1] }, "1"] },
-                  then: { $substr: ["$cleanTo", 1, 3] },
-                  else: { $substr: ["$cleanTo", 0, 3] }
+                $let: {
+                  vars: { cleaned: { $regexReplace: { input: '$to-no', regex: /\D/g, replacement: '' } } },
+                  in: {
+                    $cond: {
+                      if: { $gte: [{ $strLenCP: '$$cleaned' }, 5] },
+                      then: { $substr: ['$$cleaned', 2, 3] },
+                      else: ''
+                    }
+                  }
                 }
               },
-              else: { $ifNull: ["$areaCode", null] }
+              else: ''
             }
           }
         }
       },
-      { $match: { extractedAreaCode: { $ne: null, $ne: "" } } },
+      // Optional filtering after transformation
+      ...(callType ? [{ $match: { callType } }] : []),
+      ...(status ? [{ $match: { status } }] : []),
+      // Only keep non-empty area codes (implicitly outgoing only)
+      { $match: { areaCode: { $ne: '' } } },
       {
         $group: {
-          _id: "$extractedAreaCode",
+          _id: '$areaCode',
           totalCalls: { $sum: 1 }
         }
       },
-      { $addFields: { areaCode: "$_id" } },
-      { $project: { _id: 0, areaCode: 1, totalCalls: 1 } }
+      { $project: { _id: 0, areaCode: '$_id', totalCalls: 1 } }
     ];
 
     // Search filtering (after grouping) — by areaCode for now
@@ -365,6 +353,10 @@ router.get('/area-codes', auth, checkPermission('viewAnalytics'), async (req, re
 
     // Execute aggregation
     const areaCodes = await CDR.aggregate(pipeline);
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('AreaCodes params:', { collection, dateFrom, dateTo, callType, status, search: req.query.search });
+      console.log('AreaCodes result sample:', areaCodes.slice(0, 3));
+    }
 
     // Map area codes to rough US state names (extend as needed)
     const STATE_MAP = {
