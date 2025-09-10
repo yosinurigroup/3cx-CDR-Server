@@ -349,14 +349,11 @@ router.get('/area-codes', auth, checkPermission('viewAnalytics'), async (req, re
       { $project: { _id: 0, areaCode: 1, totalCalls: 1 } }
     ];
 
-    // Search filtering (after grouping)
+    // Search filtering (after grouping) — by areaCode for now
     if (req.query.search) {
       pipeline.push({
         $match: {
-          $or: [
-            { areaCode: { $regex: req.query.search, $options: 'i' } },
-            { state: { $regex: req.query.search, $options: 'i' } }
-          ]
+          areaCode: { $regex: req.query.search, $options: 'i' }
         }
       });
     }
@@ -369,12 +366,33 @@ router.get('/area-codes', auth, checkPermission('viewAnalytics'), async (req, re
     // Execute aggregation
     const areaCodes = await CDR.aggregate(pipeline);
 
+    // Map area codes to rough US state names (extend as needed)
+    const STATE_MAP = {
+      California: new Set(['209','213','279','310','323','341','369','408','415','424','442','510','530','559','562','619','626','650','657','661','669','707','714','747','760','805','818','820','831','840','858','909','916','925','926','935','949','951']),
+      New_York: new Set(['212','315','332','347','516','518','585','607','631','646','680','716','718','838','845','914','917','929','934']),
+      Florida: new Set(['239','305','321','324','352','386','407','448','561','645','689','727','728','754','772','786','813','850','863','904','927','941','954']),
+      Arizona: new Set(['480','520','602','623','928']),
+      Ohio: new Set(['216','220','234','283','326','330','380','419','436','440','513','567','614','740','937']),
+      Puerto_Rico: new Set(['787','939']),
+      Texas: new Set(['210','214','254','281','325','346','361','409','430','432','469','512','682','713','726','737','806','817','830','832','903','915','936','940','945','956','972','979']),
+      Illinois: new Set(['217','224','309','312','331','447','464','618','630','708','730','773','779','815','847','872'])
+    };
+
+    function lookupState(code) {
+      if (!code) return 'Unknown';
+      for (const [state, set] of Object.entries(STATE_MAP)) {
+        if (set.has(String(code))) return state.replace('_', ' ');
+      }
+      return 'Unknown';
+    }
+
     // Calculate total calls for percentage calculation
     const totalCallsAcrossAllAreas = areaCodes.reduce((sum, area) => sum + area.totalCalls, 0);
 
-    // Add percentage to each area code
+    // Add state and percentage to each area code
     const areaCodesWithPercentage = areaCodes.map(area => ({
       ...area,
+      state: lookupState(area.areaCode),
       percentage: totalCallsAcrossAllAreas > 0 
         ? Math.round((area.totalCalls / totalCallsAcrossAllAreas) * 10000) / 100
         : 0
