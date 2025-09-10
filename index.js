@@ -32,8 +32,14 @@ app.use(cors({
       return callback(null, true);
     }
     
-    // Allow the specific CLIENT_URL
-    if (origin === process.env.CLIENT_URL) {
+    const hostname = new URL(origin).hostname;
+    // Allow *.vercel.app client domains (preview and prod)
+    if (/\.vercel\.app$/.test(hostname)) {
+      return callback(null, true);
+    }
+
+    // Allow your custom domain(s) such as *.123crm.net
+    if (/\.123crm\.net$/.test(hostname)) {
       return callback(null, true);
     }
     
@@ -42,6 +48,9 @@ app.use(cors({
   },
   credentials: true
 }));
+
+// Ensure preflight requests are handled
+app.options('*', cors());
 
 // Body parsing middleware
 app.use(express.json({ limit: '10mb' }));
