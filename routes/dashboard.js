@@ -146,9 +146,9 @@ router.get('/stats', auth, checkPermission('viewAnalytics'), async (req, res) =>
             { $group: { _id: '$areaCode' } },
             { $count: 'count' }
           ],
-          // Unique extensions count  
+          // Unique extensions count (outgoing calls only)
           uniqueExtensions: [
-            { $match: { extension: { $ne: '', $ne: null } } },
+            { $match: { extension: { $ne: '', $ne: null }, callType: 'outgoing' } },
             { $group: { _id: '$extension' } },
             { $count: 'count' }
           ],
@@ -175,9 +175,9 @@ router.get('/stats', auth, checkPermission('viewAnalytics'), async (req, res) =>
               }
             }
           ],
-          // Top 30 extensions distribution
+          // Top 30 extensions distribution (outgoing calls only)
           extensionDistribution: [
-            { $match: { extension: { $ne: '', $ne: null } } },
+            { $match: { extension: { $ne: '', $ne: null }, callType: 'outgoing' } },
             {
               $group: {
                 _id: '$extension',

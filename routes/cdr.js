@@ -323,11 +323,94 @@ router.get('/extensions', auth, checkPermission('viewAnalytics'), async (req, re
     // Get the appropriate CDR model based on collection parameter
     const CDR = getCDRModel(collection);
 
-    // Aggregate extensions with statistics
+    // Aggregate extensions with statistics (outgoing calls only)
     const pipeline = [
       {
+        $addFields: {
+          // Transform call type based on from-no field (same logic as dashboard)
+          callType: {
+            $cond: {
+              if: { $regexMatch: { input: { $ifNull: ['$from-no', ''] }, regex: "^Ext\\." } },
+              then: 'outgoing',
+              else: 'incoming'
+            }
+          },
+          // Extract extension from from-no field for outgoing calls
+          extension: {
+            $cond: {
+              if: { $regexMatch: { input: { $ifNull: ['$from-no', ''] }, regex: "^Ext\\." } },
+              then: { $substr: ['$from-no', 4, -1] },
+              else: null
+            }
+          },
+          // Clean cost field (same logic as dashboard)
+          cost: { 
+            $cond: {
+              if: { 
+                $and: [
+                  { $ne: [{ $ifNull: ['$bill-cost', ''] }, ''] },
+                  { $ne: [{ $ifNull: ['$bill-cost', ''] }, null] },
+                  { $type: '$bill-cost' }
+                ]
+              },
+              then: { 
+                $convert: {
+                  input: '$bill-cost',
+                  to: 'double',
+                  onError: 0
+                }
+              },
+              else: 0
+            }
+          },
+          // Clean duration field - convert string duration to seconds (same logic as dashboard)
+          durationSeconds: {
+            $cond: {
+              if: { $and: [
+                { $ne: [{ $ifNull: ['$duration', ''] }, ''] },
+                { $regexMatch: { input: { $ifNull: ['$duration', ''] }, regex: "^\\d+:\\d+:\\d+$" } }
+              ]},
+              then: {
+                $let: {
+                  vars: {
+                    parts: { $split: ['$duration', ':'] }
+                  },
+                  in: {
+                    $add: [
+                      { $multiply: [{
+                        $convert: {
+                          input: { $arrayElemAt: ['$$parts', 0] },
+                          to: 'int',
+                          onError: 0
+                        }
+                      }, 3600] },
+                      { $multiply: [{
+                        $convert: {
+                          input: { $arrayElemAt: ['$$parts', 1] },
+                          to: 'int',
+                          onError: 0
+                        }
+                      }, 60] },
+                      {
+                        $convert: {
+                          input: { $arrayElemAt: ['$$parts', 2] },
+                          to: 'int',
+                          onError: 0
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              else: 0
+            }
+          }
+        }
+      },
+      {
         $match: {
-          extension: { $exists: true, $ne: null, $ne: '' }
+          extension: { $ne: '', $ne: null },
+          callType: 'outgoing'
         }
       },
       {
