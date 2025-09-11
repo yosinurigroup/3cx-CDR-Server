@@ -1,0 +1,453 @@
+const express = require('express');
+const { getCDRModel } = require('../models/CDR');
+const { auth, checkPermission } = require('../middleware/auth');
+
+const router = express.Router();
+
+// Store active SSE connections
+const sseConnections = new Map();
+
+// @route   GET /api/realtime/dashboard-stream
+// @desc    Server-Sent Events stream for real-time dashboard updates
+// @access  Private
+router.get('/dashboard-stream', (req, res) => {
+  const { collection, token } = req.query;
+  
+  // Verify token manually since EventSource can't send headers
+  if (!token) {
+    return res.status(401).json({ error: 'Authentication token required' });
+  }
+  
+  // Verify JWT token
+  const jwt = require('jsonwebtoken');
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
+  } catch (error) {
+    return res.status(401).json({ error: 'Invalid authentication token' });
+  }
+  
+  // Set SSE headers
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Cache-Control'
+  });
+
+  // Generate unique connection ID
+  const connectionId = `${Date.now()}-${Math.random()}`;
+  
+  // Store connection
+  sseConnections.set(connectionId, {
+    res,
+    collection,
+    userId: req.user.id,
+    lastHeartbeat: Date.now()
+  });
+
+  console.log(`📡 SSE connection established: ${connectionId} for collection: ${collection}`);
+
+  // Send initial connection confirmation
+  res.write(`data: ${JSON.stringify({
+    type: 'connected',
+    connectionId,
+    timestamp: new Date().toISOString()
+  })}\n\n`);
+
+  // Send heartbeat every 30 seconds
+  const heartbeatInterval = setInterval(() => {
+    if (sseConnections.has(connectionId)) {
+      try {
+        res.write(`data: ${JSON.stringify({
+          type: 'heartbeat',
+          timestamp: new Date().toISOString()
+        })}\n\n`);
+        sseConnections.get(connectionId).lastHeartbeat = Date.now();
+      } catch (error) {
+        console.log(`💔 Heartbeat failed for ${connectionId}, removing connection`);
+        clearInterval(heartbeatInterval);
+        sseConnections.delete(connectionId);
+      }
+    } else {
+      clearInterval(heartbeatInterval);
+    }
+  }, 30000);
+
+  // Handle client disconnect
+  req.on('close', () => {
+    console.log(`🔌 SSE connection closed: ${connectionId}`);
+    clearInterval(heartbeatInterval);
+    sseConnections.delete(connectionId);
+  });
+
+  req.on('error', (error) => {
+    console.error(`❌ SSE connection error for ${connectionId}:`, error);
+    clearInterval(heartbeatInterval);
+    sseConnections.delete(connectionId);
+  });
+});
+
+// Function to broadcast dashboard updates to all connected clients
+async function broadcastDashboardUpdate(collection) {
+  if (sseConnections.size === 0) return;
+
+  try {
+    // Get updated dashboard stats
+    const CDR = getCDRModel(collection);
+    
+    // Use the same aggregation pipeline as dashboard route
+    const pipeline = [
+      {
+        $addFields: {
+          callType: {
+            $cond: {
+              if: { $regexMatch: { input: { $ifNull: ['$from-no', ''] }, regex: "^Ext\\." } },
+              then: 'outgoing',
+              else: {
+                $cond: {
+                  if: { $regexMatch: { input: { $ifNull: ['$from-no', ''] }, regex: "^\\+?\\d" } },
+                  then: 'incoming',
+                  else: 'outgoing'
+                }
+              }
+            }
+          },
+          rawAreaCode: {
+            $cond: {
+              if: { $and: [
+                { $ne: [{ $ifNull: ['$areaCode', ''] }, ''] },
+                { $ne: [{ $ifNull: ['$areaCode', ''] }, null] }
+              ]},
+              then: { $toString: '$areaCode' },
+              else: {
+                $cond: {
+                  if: { $regexMatch: { input: { $ifNull: ['$from-no', ''] }, regex: "^Ext\\." } },
+                  then: { $toString: '$to-no' },
+                  else: ''
+                }
+              }
+            }
+          },
+          normalizedAreaCode: {
+            $let: {
+              vars: {
+                digitChars: {
+                  $regexFindAll: {
+                    input: { $ifNull: ['$rawAreaCode', ''] },
+                    regex: '\\d'
+                  }
+                }
+              },
+              in: {
+                $let: {
+                  vars: {
+                    digits: {
+                      $reduce: {
+                        input: '$$digitChars.match',
+                        initialValue: '',
+                        in: { $concat: ['$$value', '$$this'] }
+                      }
+                    }
+                  },
+                  in: {
+                    $cond: {
+                      if: { $and: [{ $gte: [{ $strLenCP: '$$digits' }, 4] }, { $eq: [{ $substrCP: ['$$digits', 0, 1] }, '1'] }] },
+                      then: { $substrCP: ['$$digits', 1, 3] },
+                      else: { $substrCP: ['$$digits', 0, 3] }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          extension: { $ifNull: ['$from-dn', ''] },
+          cost: { 
+            $cond: {
+              if: { 
+                $and: [
+                  { $ne: [{ $ifNull: ['$bill-cost', ''] }, ''] },
+                  { $ne: [{ $ifNull: ['$bill-cost', ''] }, null] },
+                  { $type: '$bill-cost' }
+                ]
+              },
+              then: { 
+                $convert: {
+                  input: '$bill-cost',
+                  to: 'double',
+                  onError: 0
+                }
+              },
+              else: 0
+            }
+          },
+          durationSeconds: {
+            $cond: {
+              if: { $and: [
+                { $ne: [{ $ifNull: ['$duration', ''] }, ''] },
+                { $regexMatch: { input: { $ifNull: ['$duration', ''] }, regex: "^\\d+:\\d+:\\d+$" } }
+              ]},
+              then: {
+                $let: {
+                  vars: {
+                    parts: { $split: ['$duration', ':'] }
+                  },
+                  in: {
+                    $add: [
+                      { $multiply: [{
+                        $convert: {
+                          input: { $arrayElemAt: ['$$parts', 0] },
+                          to: 'int',
+                          onError: 0
+                        }
+                      }, 3600] },
+                      { $multiply: [{
+                        $convert: {
+                          input: { $arrayElemAt: ['$$parts', 1] },
+                          to: 'int',
+                          onError: 0
+                        }
+                      }, 60] },
+                      {
+                        $convert: {
+                          input: { $arrayElemAt: ['$$parts', 2] },
+                          to: 'int',
+                          onError: 0
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              else: 0
+            }
+          }
+        }
+      },
+      {
+        $facet: {
+          totalStats: [
+            {
+              $group: {
+                _id: null,
+                totalCalls: { $sum: 1 },
+                incomingCalls: { $sum: { $cond: [{ $eq: ['$callType', 'incoming'] }, 1, 0] } },
+                outgoingCalls: { $sum: { $cond: [{ $eq: ['$callType', 'outgoing'] }, 1, 0] } },
+                totalCost: { $sum: '$cost' },
+                totalDuration: { $sum: '$durationSeconds' },
+                avgDuration: { $avg: '$durationSeconds' }
+              }
+            }
+          ],
+          uniqueAreaCodes: [
+            { $match: { normalizedAreaCode: { $ne: '', $ne: null } } },
+            { $group: { _id: '$normalizedAreaCode' } },
+            { $count: 'count' }
+          ],
+          uniqueExtensions: [
+            { $match: { extension: { $ne: '', $ne: null }, callType: 'outgoing' } },
+            { $group: { _id: '$extension' } },
+            { $count: 'count' }
+          ],
+          areaCodeDistribution: [
+            { $match: { normalizedAreaCode: { $ne: '', $ne: null } } },
+            {
+              $group: {
+                _id: '$normalizedAreaCode',
+                count: { $sum: 1 },
+                totalCost: { $sum: '$cost' },
+                totalDuration: { $sum: '$durationSeconds' }
+              }
+            },
+            { $sort: { count: -1 } },
+            { $limit: 30 },
+            {
+              $project: {
+                areaCode: '$_id',
+                count: 1,
+                totalCost: { $round: ['$totalCost', 2] },
+                totalDuration: 1,
+                _id: 0
+              }
+            }
+          ],
+          extensionDistribution: [
+            { $match: { extension: { $ne: '', $ne: null }, callType: 'outgoing' } },
+            {
+              $group: {
+                _id: '$extension',
+                count: { $sum: 1 },
+                incomingCalls: { $sum: { $cond: [{ $eq: ['$callType', 'incoming'] }, 1, 0] } },
+                outgoingCalls: { $sum: { $cond: [{ $eq: ['$callType', 'outgoing'] }, 1, 0] } },
+                totalDuration: { $sum: '$durationSeconds' }
+              }
+            },
+            { $sort: { count: -1 } },
+            { $limit: 30 },
+            {
+              $project: {
+                extension: '$_id',
+                count: 1,
+                incomingCalls: 1,
+                outgoingCalls: 1,
+                totalDuration: 1,
+                _id: 0
+              }
+            }
+          ]
+        }
+      }
+    ];
+
+    const results = await CDR.aggregate(pipeline);
+    
+    const totalStats = results[0].totalStats[0] || {
+      totalCalls: 0,
+      incomingCalls: 0,
+      outgoingCalls: 0,
+      totalCost: 0,
+      totalDuration: 0,
+      avgDuration: 0
+    };
+
+    const uniqueAreaCodesCount = results[0].uniqueAreaCodes[0]?.count || 0;
+    const uniqueExtensionsCount = results[0].uniqueExtensions[0]?.count || 0;
+    const areaCodeDistribution = results[0].areaCodeDistribution || [];
+    const extensionDistribution = results[0].extensionDistribution || [];
+
+    const incomingPercentage = totalStats.totalCalls > 0 ? (totalStats.incomingCalls / totalStats.totalCalls) * 100 : 0;
+    const outgoingPercentage = totalStats.totalCalls > 0 ? (totalStats.outgoingCalls / totalStats.totalCalls) * 100 : 0;
+
+    const areaCodeDistributionWithPercentage = areaCodeDistribution.map(item => ({
+      ...item,
+      percentage: totalStats.totalCalls > 0 ? (item.count / totalStats.totalCalls) * 100 : 0
+    }));
+
+    const extensionDistributionWithPercentage = extensionDistribution.map(item => ({
+      ...item,
+      percentage: totalStats.totalCalls > 0 ? (item.count / totalStats.totalCalls) * 100 : 0
+    }));
+
+    const dashboardData = {
+      summary: {
+        totalCalls: totalStats.totalCalls,
+        incomingCalls: totalStats.incomingCalls,
+        outgoingCalls: totalStats.outgoingCalls,
+        uniqueAreaCodes: uniqueAreaCodesCount,
+        uniqueExtensions: uniqueExtensionsCount,
+        totalCost: Math.round(totalStats.totalCost * 100) / 100,
+        totalDuration: totalStats.totalDuration,
+        avgDuration: Math.round(totalStats.avgDuration || 0),
+        incomingPercentage: Math.round(incomingPercentage * 100) / 100,
+        outgoingPercentage: Math.round(outgoingPercentage * 100) / 100
+      },
+      areaCodeDistribution: areaCodeDistributionWithPercentage,
+      extensionDistribution: extensionDistributionWithPercentage
+    };
+
+    // Broadcast to all connected clients for this collection
+    const message = JSON.stringify({
+      type: 'dashboard-update',
+      data: dashboardData,
+      timestamp: new Date().toISOString(),
+      collection
+    });
+
+    const connectionsToRemove = [];
+    
+    for (const [connectionId, connection] of sseConnections.entries()) {
+      if (connection.collection === collection) {
+        try {
+          connection.res.write(`data: ${message}\n\n`);
+        } catch (error) {
+          console.log(`💔 Failed to send update to ${connectionId}, removing connection`);
+          connectionsToRemove.push(connectionId);
+        }
+      }
+    }
+
+    // Clean up failed connections
+    connectionsToRemove.forEach(id => sseConnections.delete(id));
+
+    console.log(`📊 Broadcasted dashboard update to ${sseConnections.size} connections for collection: ${collection}`);
+
+  } catch (error) {
+    console.error('❌ Error broadcasting dashboard update:', error);
+  }
+}
+
+// MongoDB Change Stream setup
+let changeStreams = new Map();
+
+function setupChangeStream(collection) {
+  if (changeStreams.has(collection)) return;
+
+  try {
+    const CDR = getCDRModel(collection);
+    
+    const changeStream = CDR.watch([
+      {
+        $match: {
+          operationType: { $in: ['insert', 'update', 'delete'] }
+        }
+      }
+    ], {
+      fullDocument: 'updateLookup'
+    });
+
+    changeStream.on('change', (change) => {
+      console.log(`🔄 MongoDB change detected in ${collection}:`, change.operationType);
+      
+      // Debounce updates to avoid overwhelming clients
+      if (!changeStream.updateTimeout) {
+        changeStream.updateTimeout = setTimeout(() => {
+          broadcastDashboardUpdate(collection);
+          delete changeStream.updateTimeout;
+        }, 2000); // Wait 2 seconds before sending update
+      }
+    });
+
+    changeStream.on('error', (error) => {
+      console.error(`❌ Change stream error for ${collection}:`, error);
+      changeStreams.delete(collection);
+      
+      // Retry after 5 seconds
+      setTimeout(() => {
+        console.log(`🔄 Retrying change stream for ${collection}`);
+        setupChangeStream(collection);
+      }, 5000);
+    });
+
+    changeStreams.set(collection, changeStream);
+    console.log(`👁️ Change stream established for collection: ${collection}`);
+
+  } catch (error) {
+    console.error(`❌ Failed to setup change stream for ${collection}:`, error);
+  }
+}
+
+// Initialize change streams for known collections
+const collections = ['cdrs_143.198.0.104', 'cdrs_167.71.120.52'];
+collections.forEach(collection => {
+  setTimeout(() => setupChangeStream(collection), 1000);
+});
+
+// Cleanup inactive connections every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  const connectionsToRemove = [];
+  
+  for (const [connectionId, connection] of sseConnections.entries()) {
+    if (now - connection.lastHeartbeat > 300000) { // 5 minutes
+      connectionsToRemove.push(connectionId);
+    }
+  }
+  
+  connectionsToRemove.forEach(id => {
+    console.log(`🧹 Cleaning up inactive connection: ${id}`);
+    sseConnections.delete(id);
+  });
+}, 300000);
+
+module.exports = router;

@@ -84,6 +84,7 @@ const cdrRoutes = require('./routes/cdr');
 const analyticsRoutes = require('./routes/analytics');
 const dashboardRoutes = require('./routes/dashboard');
 const userRoutes = require('./routes/users');
+const realtimeRoutes = require('./routes/realtime');
 
 // API routes
 app.use('/api/auth', authRoutes);
@@ -91,6 +92,7 @@ app.use('/api/cdr', cdrRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/realtime', realtimeRoutes);
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {

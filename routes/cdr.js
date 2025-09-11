@@ -515,6 +515,7 @@ router.get('/area-codes', auth, checkPermission('viewCallLogs'), async (req, res
       sortBy: Joi.string().valid('totalCalls', 'areaCode', 'state', 'totalDuration', 'totalCost').default('totalCalls'),
       sortOrder: Joi.string().valid('asc', 'desc').default('desc'),
       search: Joi.string().allow('').optional().default(''),
+      state: Joi.string().allow('').optional(),
       dateFrom: Joi.date().optional(),
       dateTo: Joi.date().optional(),
       collection: Joi.string().valid('cdrs_143.198.0.104', 'cdrs_167.71.120.52').optional().default(process.env.MONGODB_COLLECTION1)
@@ -534,6 +535,7 @@ router.get('/area-codes', auth, checkPermission('viewCallLogs'), async (req, res
       sortBy = 'totalCalls',
       sortOrder = 'desc',
       search = '',
+      state,
       dateFrom,
       dateTo,
       collection = process.env.MONGODB_COLLECTION1
@@ -751,6 +753,13 @@ router.get('/area-codes', auth, checkPermission('viewCallLogs'), async (req, res
       state: lookupState(a.areaCode),
       percentage: totalCallsAcrossAllAreas > 0 ? Math.round((a.totalCalls / totalCallsAcrossAllAreas) * 10000) / 100 : 0
     }));
+
+    // State filtering (from URL parameter)
+    if (state) {
+      areaCodes = areaCodes.filter(a => 
+        (a.state || '').toLowerCase() === state.toLowerCase()
+      );
+    }
 
     // Search filtering (client-like): by areaCode or state
     const searchLower = (search || '').toString().toLowerCase();

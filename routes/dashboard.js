@@ -154,7 +154,7 @@ router.get('/stats', auth, checkPermission('viewAnalytics'), async (req, res) =>
           ],
           // Top 30 area codes distribution
           areaCodeDistribution: [
-            { $match: { areaCode: { $ne: '', $ne: null } } },
+            { $match: { areaCode: { $ne: '', $ne: null, $exists: true } } },
             {
               $group: {
                 _id: '$areaCode',
