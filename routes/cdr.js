@@ -115,16 +115,11 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
 
     const isExport = String(req.query.export || '').toLowerCase() === 'true';
 
-    // Execute query (export returns all up to a safe cap; UI fetch is paginated)
-    const exportLimit = 10000; // safety cap
-    const [rawCallLogs, totalCount] = await Promise.all([
-      CDR.find(query)
-        .sort(sort)
-        .skip(isExport ? 0 : skip)
-        .limit(isExport ? exportLimit : limit)
-        .lean(),
-      CDR.countDocuments(query)
-    ]);
+    // Execute query
+    const rawCallLogs = await CDR.find(query)
+      .sort(sort)
+      .limit(isExport ? 10000 : 20000) // Fetch a large set for in-memory filtering, or cap for export
+      .lean();
 
     // Transform raw data to expected frontend format
     const callLogs = rawCallLogs.map(log => {
@@ -170,16 +165,19 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
     }
 
     // Filter by call type after transformation (since it's derived from fromNumber)
-    if (callTypeFilter) {
-      filteredCallLogs = filteredCallLogs.filter(log => log.callType === callTypeFilter);
+    if (callType) {
+      filteredCallLogs = filteredCallLogs.filter(log => log.callType === callType);
     }
 
-    // Recalculate pagination for filtered results
-    const filteredTotalCount = filteredCallLogs.length;
-    const filteredTotalPages = Math.ceil(filteredTotalCount / limit);
+    // Determine which dataset to use for pagination and response
+    const isFiltered = areaCode || extension || callType;
+    const finalLogs = isFiltered ? filteredCallLogs : callLogs;
+    const totalCount = finalLogs.length;
+    const totalPages = Math.ceil(totalCount / limit);
+
+    // Apply pagination to the final dataset
     const startIndex = (page - 1) * limit;
-    const endIndex = startIndex + limit;
-    const paginatedFilteredLogs = filteredCallLogs.slice(startIndex, endIndex);
+    const paginatedLogs = finalLogs.slice(startIndex, startIndex + limit);
 
     // Helper function to calculate duration in seconds
     function calculateDurationSeconds(duration, startTime, endTime) {
@@ -246,7 +244,7 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
     // CSV export handling
     if (isExport) {
       // Choose dataset honoring callType filter post-transform
-      const exportRows = callTypeFilter ? filteredCallLogs : callLogs;
+      const exportRows = callType ? filteredCallLogs : callLogs;
 
       // Build CSV
       const headers = [
@@ -285,27 +283,16 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
       return res.status(200).send(csv);
     }
 
-    // Calculate pagination info
-    const totalPages = Math.ceil(totalCount / limit);
-    const hasNextPage = page < totalPages;
-    const hasPrevPage = page > 1;
 
     res.json({
-      callLogs: callTypeFilter ? paginatedFilteredLogs : callLogs,
-      pagination: callTypeFilter ? {
+      callLogs: paginatedLogs,
+      pagination: {
         currentPage: page,
-        totalPages: filteredTotalPages,
-        totalCount: filteredTotalCount,
+        totalPages: totalPages,
+        totalCount: totalCount,
         limit,
-        hasNextPage: page < filteredTotalPages,
+        hasNextPage: page < totalPages,
         hasPrevPage: page > 1
-      } : {
-        currentPage: page,
-        totalPages,
-        totalCount,
-        limit,
-        hasNextPage,
-        hasPrevPage
       },
       filters: {
         dateFrom,
