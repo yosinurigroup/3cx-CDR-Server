@@ -17,9 +17,11 @@ const querySchema = Joi.object({
   callType: Joi.string().valid('incoming', 'outgoing', 'internal').optional(),
   status: Joi.string().valid('answered', 'unanswered', 'redirected', 'waiting').optional(),
   terminationReason: Joi.string().optional(),
+  extension: Joi.string().optional(),
   areaCode: Joi.string().optional(),
   trunkNumber: Joi.string().optional(),
-  collection: Joi.string().valid('cdrs_143.198.0.104', 'cdrs_167.71.120.52').optional()
+  collection: Joi.string().valid('cdrs_143.198.0.104', 'cdrs_167.71.120.52').optional(),
+  export: Joi.boolean().optional()
 });
 
 // @route   GET /api/cdr/call-logs
@@ -49,7 +51,8 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
       terminationReason,
       areaCode,
       trunkNumber,
-      collection
+      collection,
+      extension
     } = value;
 
     // Get the appropriate CDR model based on collection parameter
@@ -110,12 +113,15 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
     const actualSortField = sortFieldMap[sortBy] || 'time-start';
     sort[actualSortField] = sortOrder === 'asc' ? 1 : -1;
 
-    // Execute query with pagination
+    const isExport = String(req.query.export || '').toLowerCase() === 'true';
+
+    // Execute query (export returns all up to a safe cap; UI fetch is paginated)
+    const exportLimit = 10000; // safety cap
     const [rawCallLogs, totalCount] = await Promise.all([
       CDR.find(query)
         .sort(sort)
-        .skip(skip)
-        .limit(limit)
+        .skip(isExport ? 0 : skip)
+        .limit(isExport ? exportLimit : limit)
         .lean(),
       CDR.countDocuments(query)
     ]);
@@ -148,10 +154,24 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
       };
     });
 
-    // Filter by call type after transformation (since it's derived from fromNumber)
+    // Apply post-transformation filters
     let filteredCallLogs = callLogs;
+
+    // Filter by area code (after transformation since it's extracted from toNumber)
+    if (areaCode) {
+      filteredCallLogs = filteredCallLogs.filter(log => log.areaCode === areaCode);
+    }
+
+    // Filter by extension (after transformation)
+    if (extension) {
+      filteredCallLogs = filteredCallLogs.filter(log => 
+        log.extension && log.extension.includes(extension)
+      );
+    }
+
+    // Filter by call type after transformation (since it's derived from fromNumber)
     if (callTypeFilter) {
-      filteredCallLogs = callLogs.filter(log => log.callType === callTypeFilter);
+      filteredCallLogs = filteredCallLogs.filter(log => log.callType === callTypeFilter);
     }
 
     // Recalculate pagination for filtered results
@@ -223,6 +243,48 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
       return '';
     }
 
+    // CSV export handling
+    if (isExport) {
+      // Choose dataset honoring callType filter post-transform
+      const exportRows = callTypeFilter ? filteredCallLogs : callLogs;
+
+      // Build CSV
+      const headers = [
+        'History ID','Start Time','End Time','Duration (s)','From','To','Type','State','Area Code','Extension','Cost','Termination Reason','Trunk','Status'
+      ];
+      const escapeCsv = (val) => {
+        if (val === null || val === undefined) return '';
+        const str = String(val);
+        if (/[",\n]/.test(str)) return '"' + str.replace(/"/g, '""') + '"';
+        return str;
+      };
+      const lines = [headers.join(',')];
+      for (const row of exportRows) {
+        lines.push([
+          row.historyId,
+          row.startTime ? new Date(row.startTime).toISOString() : '',
+          row.endTime ? new Date(row.endTime).toISOString() : '',
+          row.durationSeconds,
+          row.fromNumber,
+          row.toNumber,
+          row.callType,
+          row.stateCode || '',
+          row.areaCode || '',
+          row.extension || '',
+          typeof row.cost === 'number' ? row.cost.toFixed(2) : '0.00',
+          row.terminationReason || '',
+          row.trunkNumber || '',
+          row.status || ''
+        ].map(escapeCsv).join(','));
+      }
+
+      const csv = lines.join('\n');
+      const filename = `call-logs-${new Date().toISOString().slice(0,10)}.csv`;
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.status(200).send(csv);
+    }
+
     // Calculate pagination info
     const totalPages = Math.ceil(totalCount / limit);
     const hasNextPage = page < totalPages;
@@ -260,158 +322,6 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
     console.error('Get call logs error:', error);
     res.status(500).json({
       error: 'Server error while fetching call logs'
-    });
-  }
-});
-
-// @route   GET /api/cdr/area-codes
-// @desc    Get area codes with call statistics
-// @access  Private
-router.get('/area-codes', auth, checkPermission('viewAnalytics'), async (req, res) => {
-  try {
-    const { page = 1, limit = 50, sortBy = 'totalCalls', sortOrder = 'desc', collection, dateFrom, dateTo, callType, status } = req.query;
-
-    // Get the appropriate CDR model based on collection parameter
-    const CDR = getCDRModel(collection);
-
-    // Align logic with analytics /area-code-distribution for consistency
-    const pipeline = [
-      // Optional date filtering (match analytics behavior)
-      {
-        $match: (() => {
-          const q = {};
-          if (dateFrom || dateTo) {
-            q['time-start'] = {};
-            if (dateFrom) q['time-start'].$gte = new Date(dateFrom);
-            if (dateTo) q['time-start'].$lte = new Date(dateTo);
-          }
-          return q;
-        })()
-      },
-      {
-        $addFields: {
-          callType: {
-            $cond: {
-              if: { $regexMatch: { input: '$from-no', regex: /^Ext\./ } },
-              then: 'outgoing',
-              else: {
-                $cond: {
-                  if: { $regexMatch: { input: '$from-no', regex: /^\+?\d/ } },
-                  then: 'incoming',
-                  else: 'outgoing'
-                }
-              }
-            }
-          },
-          areaCode: {
-            $cond: {
-              if: { $regexMatch: { input: '$from-no', regex: /^Ext\./ } },
-              then: {
-                $let: {
-                  vars: { cleaned: { $regexReplace: { input: '$to-no', regex: /\D/g, replacement: '' } } },
-                  in: {
-                    $cond: {
-                      if: { $gte: [{ $strLenCP: '$$cleaned' }, 5] },
-                      then: { $substr: ['$$cleaned', 2, 3] },
-                      else: ''
-                    }
-                  }
-                }
-              },
-              else: ''
-            }
-          }
-        }
-      },
-      // Optional filtering after transformation
-      ...(callType ? [{ $match: { callType } }] : []),
-      ...(status ? [{ $match: { status } }] : []),
-      // Only keep non-empty area codes (implicitly outgoing only)
-      { $match: { areaCode: { $ne: '' } } },
-      {
-        $group: {
-          _id: '$areaCode',
-          totalCalls: { $sum: 1 }
-        }
-      },
-      { $project: { _id: 0, areaCode: '$_id', totalCalls: 1 } }
-    ];
-
-    // Search filtering (after grouping) — by areaCode for now
-    if (req.query.search) {
-      pipeline.push({
-        $match: {
-          areaCode: { $regex: req.query.search, $options: 'i' }
-        }
-      });
-    }
-
-    // Add sorting
-    const sortObj = {};
-    sortObj[sortBy] = sortOrder === 'asc' ? 1 : -1;
-    pipeline.push({ $sort: sortObj });
-
-    // Execute aggregation
-    const areaCodes = await CDR.aggregate(pipeline);
-    if (process.env.NODE_ENV !== 'production') {
-      console.log('AreaCodes params:', { collection, dateFrom, dateTo, callType, status, search: req.query.search });
-      console.log('AreaCodes result sample:', areaCodes.slice(0, 3));
-    }
-
-    // Map area codes to rough US state names (extend as needed)
-    const STATE_MAP = {
-      California: new Set(['209','213','279','310','323','341','369','408','415','424','442','510','530','559','562','619','626','650','657','661','669','707','714','747','760','805','818','820','831','840','858','909','916','925','926','935','949','951']),
-      New_York: new Set(['212','315','332','347','516','518','585','607','631','646','680','716','718','838','845','914','917','929','934']),
-      Florida: new Set(['239','305','321','324','352','386','407','448','561','645','689','727','728','754','772','786','813','850','863','904','927','941','954']),
-      Arizona: new Set(['480','520','602','623','928']),
-      Ohio: new Set(['216','220','234','283','326','330','380','419','436','440','513','567','614','740','937']),
-      Puerto_Rico: new Set(['787','939']),
-      Texas: new Set(['210','214','254','281','325','346','361','409','430','432','469','512','682','713','726','737','806','817','830','832','903','915','936','940','945','956','972','979']),
-      Illinois: new Set(['217','224','309','312','331','447','464','618','630','708','730','773','779','815','847','872'])
-    };
-
-    function lookupState(code) {
-      if (!code) return 'Unknown';
-      for (const [state, set] of Object.entries(STATE_MAP)) {
-        if (set.has(String(code))) return state.replace('_', ' ');
-      }
-      return 'Unknown';
-    }
-
-    // Calculate total calls for percentage calculation
-    const totalCallsAcrossAllAreas = areaCodes.reduce((sum, area) => sum + area.totalCalls, 0);
-
-    // Add state and percentage to each area code
-    const areaCodesWithPercentage = areaCodes.map(area => ({
-      ...area,
-      state: lookupState(area.areaCode),
-      percentage: totalCallsAcrossAllAreas > 0 
-        ? Math.round((area.totalCalls / totalCallsAcrossAllAreas) * 10000) / 100
-        : 0
-    }));
-
-    // Apply pagination
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const paginatedResults = areaCodesWithPercentage.slice(skip, skip + parseInt(limit));
-
-    res.json({
-      success: true,
-      areaCodes: paginatedResults,
-      pagination: {
-        currentPage: parseInt(page),
-        totalPages: Math.ceil(areaCodesWithPercentage.length / parseInt(limit)),
-        totalCount: areaCodesWithPercentage.length,
-        limit: parseInt(limit)
-      },
-      summary: {
-        totalAreaCodes: areaCodesWithPercentage.length,
-        totalCalls: totalCallsAcrossAllAreas
-      }
-    });
-  } catch (error) {
-    console.error('Get area codes error:', error);
-    res.status(500).json({
-      error: 'Server error while fetching area codes'
     });
   }
 });
@@ -512,7 +422,6 @@ router.get('/call-logs/:id', auth, checkPermission('viewCallLogs'), async (req, 
     res.json({ callLog });
   } catch (error) {
     console.error('Get call log error:', error);
-    
     if (error.name === 'CastError') {
       return res.status(400).json({
         error: 'Invalid call log ID format'
@@ -525,13 +434,23 @@ router.get('/call-logs/:id', auth, checkPermission('viewCallLogs'), async (req, 
   }
 });
 
-// @route   GET /api/cdr/area-codes
 // @desc    Get area codes with call statistics  
 // @access  Private
 router.get('/area-codes', auth, checkPermission('viewCallLogs'), async (req, res) => {
   try {
-    // Validate query parameters
-    const { error, value } = querySchema.validate(req.query);
+    // Validate query parameters with a route-specific schema
+    const areaCodesQuerySchema = Joi.object({
+      page: Joi.number().integer().min(1).default(1),
+      limit: Joi.number().integer().min(1).max(1000).default(50),
+      sortBy: Joi.string().valid('totalCalls', 'areaCode', 'state', 'totalDuration', 'totalCost').default('totalCalls'),
+      sortOrder: Joi.string().valid('asc', 'desc').default('desc'),
+      search: Joi.string().allow('').optional().default(''),
+      dateFrom: Joi.date().optional(),
+      dateTo: Joi.date().optional(),
+      collection: Joi.string().valid('cdrs_143.198.0.104', 'cdrs_167.71.120.52').optional().default(process.env.MONGODB_COLLECTION1)
+    });
+
+    const { error, value } = areaCodesQuerySchema.validate(req.query);
     if (error) {
       return res.status(400).json({
         error: 'Invalid query parameters',
@@ -585,6 +504,18 @@ router.get('/area-codes', auth, checkPermission('viewCallLogs'), async (req, res
 
     // Robust aggregation pipeline that derives fields from raw CDR columns
     const pipeline = [
+      // Optional date filtering (match analytics behavior)
+      {
+        $match: (() => {
+          const q = {};
+          if (dateFrom || dateTo) {
+            q['time-start'] = {};
+            if (dateFrom) q['time-start'].$gte = new Date(dateFrom);
+            if (dateTo) q['time-start'].$lte = new Date(dateTo);
+          }
+          return q;
+        })()
+      },
       // Derive fields from raw CDR document
       {
         $addFields: {
@@ -612,7 +543,7 @@ router.get('/area-codes', auth, checkPermission('viewCallLogs'), async (req, res
       },
       // Only outgoing
       { $match: { callType: "outgoing" } },
-      // Clean destination number and extract 3-digit area code
+      // Clean destination number and extract 3-digit area code (match CallLogsPage logic)
       {
         $addFields: {
           cleanTo: {
@@ -620,13 +551,75 @@ router.get('/area-codes', auth, checkPermission('viewCallLogs'), async (req, res
               input: {
                 $replaceAll: {
                   input: {
-                    $replaceAll: { input: { $toString: "$toNumberRaw" }, find: "+", replacement: "" }
+                    $replaceAll: {
+                      input: {
+                        $replaceAll: {
+                          input: {
+                            $replaceAll: { input: { $toString: "$toNumberRaw" }, find: "+", replacement: "" }
+                          },
+                          find: " ", replacement: ""
+                        }
+                      },
+                      find: "-", replacement: ""
+                    }
                   },
-                  find: " ", replacement: ""
+                  find: "(", replacement: ""
                 }
               },
-              find: "-", replacement: ""
+              find: ")", replacement: ""
             }
+          }
+        }
+      },
+      // Compute durationSeconds and numeric cost
+      {
+        $addFields: {
+          // Use same duration calculation as Call Logs route
+          durationSeconds: {
+            $cond: {
+              if: { $and: [ { $ne: ["$duration", null] }, { $ne: ["$duration", ""] } ] },
+              then: {
+                $let: {
+                  vars: {
+                    parts: { $split: [{ $toString: "$duration" }, ":"] }
+                  },
+                  in: {
+                    $cond: {
+                      if: { $eq: [{ $size: "$$parts" }, 3] },
+                      then: {
+                        $add: [
+                          { $multiply: [{ $toInt: { $arrayElemAt: ["$$parts", 0] } }, 3600] },
+                          { $multiply: [{ $toInt: { $arrayElemAt: ["$$parts", 1] } }, 60] },
+                          { $toInt: { $arrayElemAt: ["$$parts", 2] } }
+                        ]
+                      },
+                      else: 0
+                    }
+                  }
+                }
+              },
+              else: {
+                $cond: {
+                  if: { $and: [ { $ne: ["$time-start", null] }, { $ne: ["$time-end", null] } ] },
+                  then: {
+                    $floor: {
+                      $divide: [
+                        { $subtract: [
+                          { $convert: { input: "$time-end", to: "date", onError: null } },
+                          { $convert: { input: "$time-start", to: "date", onError: null } }
+                        ]}, 
+                        1000
+                      ]
+                    }
+                  },
+                  else: 0
+                }
+              }
+            }
+          },
+          // Parse bill-cost using $convert with safe fallback (avoid string symbol handling)
+          costNum: {
+            $convert: { input: { $toString: "$bill-cost" }, to: "double", onError: 0, onNull: 0 }
           }
         }
       },
@@ -634,15 +627,9 @@ router.get('/area-codes', auth, checkPermission('viewCallLogs'), async (req, res
         $addFields: {
           extractedAreaCode: {
             $cond: {
-              if: { $gte: [{ $strLenCP: "$cleanTo" }, 3] },
-              then: {
-                $cond: {
-                  if: { $eq: [{ $substr: ["$cleanTo", 0, 1] }, "1"] },
-                  then: { $substr: ["$cleanTo", 1, 3] },
-                  else: { $substr: ["$cleanTo", 0, 3] }
-                }
-              },
-              else: { $ifNull: ["$areaCode", null] }
+              if: { $gte: [{ $strLenCP: "$cleanTo" }, 5] },
+              then: { $substr: ["$cleanTo", 2, 3] },
+              else: null
             }
           }
         }
@@ -651,71 +638,97 @@ router.get('/area-codes', auth, checkPermission('viewCallLogs'), async (req, res
       {
         $group: {
           _id: "$extractedAreaCode",
-          totalCalls: { $sum: 1 }
+          totalCalls: { $sum: 1 },
+          totalDuration: { $sum: "$durationSeconds" },
+          totalCost: { $sum: "$costNum" }
         }
       },
       { $addFields: { areaCode: "$_id" } },
-      { $project: { _id: 0, areaCode: 1, totalCalls: 1 } },
-      { $sort: { totalCalls: -1 } }
+      { $project: { _id: 0, areaCode: 1, totalCalls: 1, totalDuration: 1, totalCost: 1 } }
     ];
 
-    // Search filtering (after grouping)
-    if (search) {
-      pipeline.push({
-        $match: {
-          $or: [
-            { areaCode: { $regex: search, $options: 'i' } },
-            { state: { $regex: search, $options: 'i' } }
-          ]
-        }
-      });
-    }
-
-    // Add sorting
-    pipeline.push({ $sort: { [sortBy]: sortOrder === 'desc' ? -1 : 1 } });
-
-    // Get total count for pagination
-    const countPipeline = [...pipeline];
-    // Remove sorting and pagination stages for counting
-    const pipelineForCount = pipeline.filter(stage => 
-      !stage.$sort && !stage.$skip && !stage.$limit
-    );
-    pipelineForCount.push({ $count: 'total' });
-    
-    const countResult = await CDR.aggregate(pipelineForCount);
-    const totalCount = countResult.length > 0 ? countResult[0].total : 0;
-
-    // Add pagination to main pipeline
-    pipeline.push({ $skip: (page - 1) * limit });
-    pipeline.push({ $limit: limit });
-
-    // Execute aggregation
+    // Execute aggregation (grouped results only)
     const startTime = Date.now();
-    
-    console.log('🔍 Area codes aggregation pipeline:', JSON.stringify(pipeline.slice(0, 3), null, 2));
-    
-    const areaCodes = await CDR.aggregate(pipeline);
+    const groupedAreas = await CDR.aggregate(pipeline);
     const endTime = Date.now();
 
-    // Calculate pagination info
+    // Map area codes to rough US state names and compute percentage
+    const STATE_MAP = {
+      California: new Set(['209','213','279','310','323','341','369','408','415','424','442','510','530','559','562','619','626','650','657','661','669','707','714','747','760','805','818','820','831','840','858','909','916','925','926','935','949','951']),
+      New_York: new Set(['212','315','332','347','516','518','585','607','631','646','680','716','718','838','845','914','917','929','934']),
+      Florida: new Set(['239','305','321','324','352','386','407','448','561','645','689','727','728','754','772','786','813','850','863','904','927','941','954']),
+      Arizona: new Set(['480','520','602','623','928']),
+      Ohio: new Set(['216','220','234','283','326','330','380','419','436','440','513','567','614','740','937']),
+      Puerto_Rico: new Set(['787','939']),
+      Texas: new Set(['210','214','254','281','325','346','361','409','430','432','469','512','682','713','726','737','806','817','830','832','903','915','936','940','945','956','972','979']),
+      Illinois: new Set(['217','224','309','312','331','447','464','618','630','708','730','773','779','815','847','872'])
+    };
+
+    function lookupState(code) {
+      if (!code) return 'Unknown';
+      for (const [state, set] of Object.entries(STATE_MAP)) {
+        if (set.has(String(code))) return state.replace('_', ' ');
+      }
+      return 'Unknown';
+    }
+
+    const totalCallsAcrossAllAreas = groupedAreas.reduce((sum, a) => sum + (a.totalCalls || 0), 0);
+    let areaCodes = groupedAreas.map(a => ({
+      areaCode: a.areaCode,
+      totalCalls: a.totalCalls,
+      totalDuration: a.totalDuration || 0,
+      totalCost: a.totalCost || 0,
+      state: lookupState(a.areaCode),
+      percentage: totalCallsAcrossAllAreas > 0 ? Math.round((a.totalCalls / totalCallsAcrossAllAreas) * 10000) / 100 : 0
+    }));
+
+    // Search filtering (client-like): by areaCode or state
+    const searchLower = (search || '').toString().toLowerCase();
+    if (searchLower) {
+      areaCodes = areaCodes.filter(a =>
+        a.areaCode.toLowerCase().includes(searchLower) ||
+        (a.state || '').toLowerCase().includes(searchLower)
+      );
+    }
+
+    // Sorting
+    areaCodes.sort((a, b) => {
+      let cmp = 0;
+      if (sortBy === 'totalCalls') {
+        cmp = (a.totalCalls - b.totalCalls);
+      } else if (sortBy === 'areaCode') {
+        cmp = a.areaCode.localeCompare(b.areaCode);
+      } else if (sortBy === 'state') {
+        cmp = (a.state || '').localeCompare(b.state || '');
+      } else if (sortBy === 'totalDuration') {
+        cmp = (a.totalDuration - b.totalDuration);
+      } else if (sortBy === 'totalCost') {
+        cmp = (a.totalCost - b.totalCost);
+      }
+      return sortOrder === 'asc' ? cmp : -cmp;
+    });
+
+    // Pagination
+    const totalCount = areaCodes.length;
     const totalPages = Math.ceil(totalCount / limit);
-    const hasNextPage = page < totalPages;
-    const hasPrevPage = page > 1;
+    const startIndex = (page - 1) * limit;
+    const paginated = areaCodes.slice(startIndex, startIndex + limit);
 
     console.log(`✨ Area codes aggregation completed in ${endTime - startTime}ms`);
-    console.log(`📊 Found ${areaCodes.length} area codes from ${totalCount} total records`);
-    console.log('🎯 Sample area codes:', areaCodes.slice(0, 3));
+    console.log(`📊 Found ${paginated.length} area codes from ${totalCount} total records after filtering`);
+    console.log('🎯 Sample area codes:', paginated.slice(0, 3));
+    console.log('🔍 Sample raw aggregation result:', groupedAreas.slice(0, 2));
 
     res.json({
       success: true,
-      areaCodes,
+      areaCodes: paginated,
       pagination: {
         currentPage: page,
         totalPages,
         totalCount,
         limit,
-        hasNextPage,
-        hasPrevPage
+        hasNextPage: page < totalPages,
+        hasPrevPage: page > 1
       }
     });
 
