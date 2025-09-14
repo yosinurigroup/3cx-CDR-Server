@@ -20,6 +20,12 @@ const querySchema = Joi.object({
   extension: Joi.string().optional(),
   areaCode: Joi.string().optional(),
   trunkNumber: Joi.string().optional(),
+  // Advanced filters
+  stateCode: Joi.string().optional(),
+  minDurationSec: Joi.number().integer().min(0).optional(),
+  maxDurationSec: Joi.number().integer().min(0).optional(),
+  minCost: Joi.number().min(0).optional(),
+  maxCost: Joi.number().min(0).optional(),
   collection: Joi.string().valid('cdrs_143.198.0.104', 'cdrs_167.71.120.52').optional(),
   export: Joi.boolean().optional()
 });
@@ -52,7 +58,12 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
       areaCode,
       trunkNumber,
       collection,
-      extension
+      extension,
+      stateCode,
+      minDurationSec,
+      maxDurationSec,
+      minCost,
+      maxCost
     } = value;
 
     // Get the appropriate CDR model based on collection parameter
@@ -130,6 +141,7 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
       return {
         _id: log._id,
         historyId: log.historyid || log.historyId || '',
+        callId: log['callid'] || log['call-id'] || log.callId || '',
         startTime: log['time-start'] || log.startTime || '',
         endTime: log['time-end'] || log.endTime || '',
         duration: log.duration || '',
@@ -145,28 +157,63 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
         // AREA CODE: Only for outgoing calls, digits 3-5 of TO number (after state)
         areaCode: callType === 'outgoing' ? extractAreaCode(toNumber) : '',
         extension: log['from-dn'] || log.extension || '',
-        status: determineCallStatus(log['time-answered'], log['reason-terminated'])
+        status: determineCallStatus(log['time-answered'], log['reason-terminated']),
+        // Additional raw/metadata fields requested for column selection
+        chain: log['chain'] || log.chain || '',
+        fromType: log['from-type'] || log.fromType || '',
+        finalType: log['final-type'] || log['to-type'] || log.finalType || '',
+        fromDispname: log['from-dispname'] || log.fromDispname || '',
+        toDispname: log['to-dispname'] || log.toDispname || '',
+        finalDispname: log['final-dispname'] || log.finalDispname || '',
+        missedQueueCalls: log['missed-queue-calls'] || log.missedQueueCalls || 0,
+        rawStream: log['raw_stream'] || log.raw_stream || log.rawStream || ''
       };
     });
 
     // Apply post-transformation filters
     let filteredCallLogs = callLogs;
 
-    // Filter by area code (after transformation since it's extracted from toNumber)
+    // Filter by area code (normalize to digits for robust match)
     if (areaCode) {
-      filteredCallLogs = filteredCallLogs.filter(log => log.areaCode === areaCode);
+      const desired = String(areaCode).replace(/\D/g, '');
+      filteredCallLogs = filteredCallLogs.filter(log => {
+        const got = String(log.areaCode || '').replace(/\D/g, '');
+        return desired ? got === desired : true;
+      });
     }
 
     // Filter by extension (after transformation)
     if (extension) {
-      filteredCallLogs = filteredCallLogs.filter(log => 
-        log.extension && log.extension.includes(extension)
+      const ext = String(extension).toLowerCase();
+      filteredCallLogs = filteredCallLogs.filter(log =>
+        (log.extension || '').toLowerCase().includes(ext)
       );
     }
 
     // Filter by call type after transformation (since it's derived from fromNumber)
     if (callType) {
       filteredCallLogs = filteredCallLogs.filter(log => log.callType === callType);
+    }
+
+    // State code (derived from toNumber for outgoing)
+    if (stateCode) {
+      filteredCallLogs = filteredCallLogs.filter(log => String(log.stateCode || '') === String(stateCode));
+    }
+
+    // Duration seconds range
+    if (typeof minDurationSec === 'number') {
+      filteredCallLogs = filteredCallLogs.filter(log => (log.durationSeconds || 0) >= minDurationSec);
+    }
+    if (typeof maxDurationSec === 'number') {
+      filteredCallLogs = filteredCallLogs.filter(log => (log.durationSeconds || 0) <= maxDurationSec);
+    }
+
+    // Cost range
+    if (typeof minCost === 'number') {
+      filteredCallLogs = filteredCallLogs.filter(log => (Number.isFinite(log.cost) ? log.cost : 0) >= minCost);
+    }
+    if (typeof maxCost === 'number') {
+      filteredCallLogs = filteredCallLogs.filter(log => (Number.isFinite(log.cost) ? log.cost : 0) <= maxCost);
     }
 
     // Determine which dataset to use for pagination and response

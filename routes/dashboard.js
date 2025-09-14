@@ -9,7 +9,18 @@ const router = express.Router();
 // @access  Private
 router.get('/stats', auth, checkPermission('viewAnalytics'), async (req, res) => {
   try {
-    const { collection } = req.query;
+    const {
+      collection,
+      dateFrom,
+      dateTo,
+      callType,
+      extension,
+      areaCode,
+      minDurationSec,
+      maxDurationSec,
+      minCost,
+      maxCost
+    } = req.query;
     
     // Get the appropriate CDR model based on collection parameter
     const CDR = getCDRModel(collection);
@@ -17,9 +28,36 @@ router.get('/stats', auth, checkPermission('viewAnalytics'), async (req, res) =>
     console.log(`🚀 Processing dashboard stats for collection: ${collection}`);
     const startTime = Date.now();
 
+    // Build dynamic stages for powerful filtering
+    const dateMatch = {};
+    if (dateFrom || dateTo) {
+      dateMatch['time-start'] = {};
+      if (dateFrom) dateMatch['time-start'].$gte = new Date(dateFrom);
+      if (dateTo) dateMatch['time-start'].$lte = new Date(dateTo);
+    }
+
+    const derivedMatch = {};
+    if (callType) derivedMatch.callType = callType;
+    if (extension) derivedMatch.extension = { $regex: String(extension), $options: 'i' };
+    if (areaCode) derivedMatch.areaCode = String(areaCode);
+    if (typeof minDurationSec !== 'undefined') derivedMatch.durationSeconds = { ...(derivedMatch.durationSeconds || {}), $gte: Number(minDurationSec) || 0 };
+    if (typeof maxDurationSec !== 'undefined') derivedMatch.durationSeconds = { ...(derivedMatch.durationSeconds || {}), $lte: Number(maxDurationSec) || 0 };
+    if (typeof minCost !== 'undefined') derivedMatch.cost = { ...(derivedMatch.cost || {}), $gte: Number(minCost) || 0 };
+    if (typeof maxCost !== 'undefined') derivedMatch.cost = { ...(derivedMatch.cost || {}), $lte: Number(maxCost) || 0 };
+
+    // Robust date range match on converted date field (works whether time-start is string or Date)
+    const timeStartRangeMatch = {};
+    if (dateFrom || dateTo) {
+      timeStartRangeMatch.timeStartDate = {};
+      if (dateFrom) timeStartRangeMatch.timeStartDate.$gte = new Date(dateFrom);
+      if (dateTo) timeStartRangeMatch.timeStartDate.$lte = new Date(dateTo);
+    }
+
     // MAGIC AGGREGATION PIPELINE 🎯
-    // This single pipeline processes ALL records efficiently
+    // This pipeline processes all records efficiently and applies filters
     const pipeline = [
+      // Optional early match for raw date range
+      ...(Object.keys(dateMatch).length ? [{ $match: dateMatch }] : []),
       {
         $addFields: {
           // Transform call type based on from-no field
@@ -61,16 +99,16 @@ router.get('/stats', auth, checkPermission('viewAnalytics'), async (req, res) =>
           // Clean extension field
           extension: { $ifNull: ['$from-dn', ''] },
           // Clean cost field
-          cost: { 
+          cost: {
             $cond: {
-              if: { 
+              if: {
                 $and: [
                   { $ne: [{ $ifNull: ['$bill-cost', ''] }, ''] },
                   { $ne: [{ $ifNull: ['$bill-cost', ''] }, null] },
                   { $type: '$bill-cost' }
                 ]
               },
-              then: { 
+              then: {
                 $convert: {
                   input: '$bill-cost',
                   to: 'double',
@@ -124,6 +162,17 @@ router.get('/stats', auth, checkPermission('viewAnalytics'), async (req, res) =>
           }
         }
       },
+      // Safe date conversion for robust range filtering regardless of field type
+      {
+        $addFields: {
+          timeStartDate: {
+            $convert: { input: '$time-start', to: 'date', onError: null, onNull: null }
+          }
+        }
+      },
+      ...(Object.keys(timeStartRangeMatch).length ? [{ $match: timeStartRangeMatch }] : []),
+      // Derived match (callType, areaCode, extension, duration, cost)
+      ...(Object.keys(derivedMatch).length ? [{ $match: derivedMatch }] : []),
       {
         $facet: {
           // Overall statistics
