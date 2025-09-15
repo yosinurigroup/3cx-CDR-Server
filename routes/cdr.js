@@ -9,7 +9,7 @@ const router = express.Router();
 const querySchema = Joi.object({
   page: Joi.number().integer().min(1).default(1),
   limit: Joi.number().integer().min(1).max(1000).default(50),
-  sortBy: Joi.string().valid('startTime', 'duration', 'cost', 'fromNumber', 'toNumber', 'historyId', 'durationSeconds').default('startTime'),
+  sortBy: Joi.string().default('startTime'),
   sortOrder: Joi.string().valid('asc', 'desc').default('desc'),
   search: Joi.string().allow('').optional(),
   dateFrom: Joi.alternatives().try(
@@ -32,8 +32,9 @@ const querySchema = Joi.object({
   maxDurationSec: Joi.number().integer().min(0).optional(),
   minCost: Joi.number().min(0).optional(),
   maxCost: Joi.number().min(0).optional(),
-  collection: Joi.string().valid('cdrs_143.198.0.104', 'cdrs_167.71.120.52').optional(),
-  export: Joi.boolean().optional()
+  collection: Joi.string().valid('cdrs_143.198.0.104', 'cdrs_167.71.120.52').allow('').optional(),
+  export: Joi.boolean().optional(),
+  raw: Joi.boolean().optional()
 });
 
 // @route   GET /api/cdr/call-logs
@@ -979,6 +980,209 @@ router.get('/area-codes', auth, checkPermission('viewCallLogs'), async (req, res
     res.status(500).json({
       error: 'Server error while fetching area codes',
       details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// @route   GET /api/cdr/raw-data
+// @desc    Get raw CDR data with all MongoDB fields (no transformations)
+// @access  Private
+router.get('/raw-data', auth, checkPermission('viewCallLogs'), async (req, res) => {
+  try {
+    // Validate query parameters
+    const { error, value } = querySchema.validate(req.query);
+    if (error) {
+      return res.status(400).json({
+        error: 'Validation Error',
+        details: error.details[0].message
+      });
+    }
+
+    const {
+      page,
+      limit,
+      sortBy,
+      sortOrder,
+      search,
+      dateFrom,
+      dateTo,
+      callType,
+      status,
+      terminationReason,
+      areaCode,
+      trunkNumber,
+      collection,
+      extension,
+      stateCode,
+      minDurationSec,
+      maxDurationSec,
+      minCost,
+      maxCost
+    } = value;
+
+    // Get the appropriate CDR model based on collection parameter
+    const CDR = getCDRModel(collection);
+
+    // Build query using actual database field names
+    const query = {};
+
+    // Date range filter - handle string dates in database format "2025/09/08 15:43:15"
+    if (dateFrom || dateTo) {
+      query['time-start'] = {};
+      if (dateFrom) {
+        try {
+          const fromDate = new Date(dateFrom);
+          if (!isNaN(fromDate.getTime())) {
+            // Convert to database string format: "YYYY/MM/DD HH:mm:ss"
+            const fromStr = fromDate.getFullYear() + '/' +
+                           String(fromDate.getMonth() + 1).padStart(2, '0') + '/' +
+                           String(fromDate.getDate()).padStart(2, '0') + ' ' +
+                           String(fromDate.getHours()).padStart(2, '0') + ':' +
+                           String(fromDate.getMinutes()).padStart(2, '0') + ':' +
+                           String(fromDate.getSeconds()).padStart(2, '0');
+            query['time-start'].$gte = fromStr;
+          }
+        } catch (error) {
+          console.warn('Invalid dateFrom format:', dateFrom);
+        }
+      }
+      if (dateTo) {
+        try {
+          const toDate = new Date(dateTo);
+          if (!isNaN(toDate.getTime())) {
+            // Convert to database string format: "YYYY/MM/DD HH:mm:ss"
+            const toStr = toDate.getFullYear() + '/' +
+                         String(toDate.getMonth() + 1).padStart(2, '0') + '/' +
+                         String(toDate.getDate()).padStart(2, '0') + ' ' +
+                         String(toDate.getHours()).padStart(2, '0') + ':' +
+                         String(toDate.getMinutes()).padStart(2, '0') + ':' +
+                         String(toDate.getSeconds()).padStart(2, '0');
+            query['time-start'].$lte = toStr;
+          }
+        } catch (error) {
+          console.warn('Invalid dateTo format:', dateTo);
+        }
+      }
+    }
+
+    // Filter by termination reason
+    if (terminationReason) query['reason-terminated'] = terminationReason;
+
+    // Filter by trunk number
+    if (trunkNumber) query['dial-no'] = trunkNumber;
+
+    // Search functionality using actual database field names - expanded for raw data
+    if (search) {
+      query.$or = [
+        { historyid: { $regex: search, $options: 'i' } },
+        { callid: { $regex: search, $options: 'i' } },
+        { 'call-id': { $regex: search, $options: 'i' } },
+        { 'from-no': { $regex: search, $options: 'i' } },
+        { 'to-no': { $regex: search, $options: 'i' } },
+        { 'from-dn': { $regex: search, $options: 'i' } },
+        { 'to-dn': { $regex: search, $options: 'i' } },
+        { 'dial-no': { $regex: search, $options: 'i' } },
+        { 'reason-terminated': { $regex: search, $options: 'i' } },
+        { 'from-dispname': { $regex: search, $options: 'i' } },
+        { 'to-dispname': { $regex: search, $options: 'i' } },
+        { 'final-dispname': { $regex: search, $options: 'i' } },
+        { 'bill-name': { $regex: search, $options: 'i' } },
+        { chain: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    // Calculate skip value for pagination
+    const skip = (page - 1) * limit;
+
+    // Build sort object using actual database field names
+    const sort = {};
+    const sortFieldMap = {
+      'startTime': 'time-start',
+      'time-start': 'time-start',
+      'duration': 'duration',
+      'cost': 'bill-cost',
+      'fromNumber': 'from-no',
+      'from-no': 'from-no',
+      'toNumber': 'to-no',
+      'to-no': 'to-no',
+      'historyId': 'historyid',
+      'historyid': 'historyid',
+      'durationSeconds': 'duration'
+    };
+    const actualSortField = sortFieldMap[sortBy] || sortBy || 'time-start';
+    sort[actualSortField] = sortOrder === 'asc' ? 1 : -1;
+
+    const isExport = String(req.query.export || '').toLowerCase() === 'true';
+
+    // Get total count for pagination
+    const totalCount = await CDR.countDocuments(query);
+    
+    // Execute query - return ALL fields from MongoDB (no field selection)
+    const rawData = await CDR.find(query)
+      .sort(sort)
+      .skip(skip)
+      .limit(limit)
+      .lean()
+      .allowDiskUse(true)
+      .maxTimeMS(30000);
+
+    const totalPages = Math.ceil(totalCount / limit);
+
+    // CSV export handling
+    if (isExport) {
+      // Get all unique field names from the data
+      const allFields = new Set();
+      rawData.forEach(record => {
+        Object.keys(record).forEach(key => allFields.add(key));
+      });
+      const fieldNames = Array.from(allFields).sort();
+
+      // Build CSV with all fields
+      const escapeCsv = (val) => {
+        if (val === null || val === undefined) return '';
+        const str = String(val);
+        if (/[",\n]/.test(str)) return '"' + str.replace(/"/g, '""') + '"';
+        return str;
+      };
+
+      const lines = [fieldNames.join(',')];
+      for (const row of rawData) {
+        const values = fieldNames.map(field => escapeCsv(row[field]));
+        lines.push(values.join(','));
+      }
+
+      const csv = lines.join('\n');
+      const filename = `raw-data-${new Date().toISOString().slice(0,10)}.csv`;
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.status(200).send(csv);
+    }
+
+    res.json({
+      rawData: rawData,
+      pagination: {
+        currentPage: page,
+        totalPages: totalPages,
+        totalCount: totalCount,
+        limit,
+        hasNextPage: page < totalPages,
+        hasPrevPage: page > 1
+      },
+      filters: {
+        dateFrom,
+        dateTo,
+        callType,
+        status,
+        terminationReason,
+        areaCode,
+        trunkNumber,
+        search
+      }
+    });
+  } catch (error) {
+    console.error('Get raw data error:', error);
+    res.status(500).json({
+      error: 'Server error while fetching raw data'
     });
   }
 });
