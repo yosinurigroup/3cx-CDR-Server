@@ -302,15 +302,50 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
       filteredCallLogs = filteredCallLogs.filter(log => (Number.isFinite(log.cost) ? log.cost : 0) <= maxCost);
     }
 
-    // Determine which dataset to use for pagination and response
-    const isFiltered = areaCode || extension || callType;
-    const finalLogs = isFiltered ? filteredCallLogs : callLogs;
-    const finalTotalCount = finalLogs.length;
-    const totalPages = Math.ceil(finalTotalCount / limit);
+    // Apply post-transformation filters but use original pagination
+    let finalLogs = callLogs;
+    
+    // Apply post-transformation filters
+    if (areaCode) {
+      const desired = String(areaCode).replace(/\D/g, '');
+      finalLogs = finalLogs.filter(log => {
+        const got = String(log.areaCode || '').replace(/\D/g, '');
+        return desired ? got === desired : true;
+      });
+    }
 
-    // Apply pagination to the final dataset
-    const startIndex = (page - 1) * limit;
-    const paginatedLogs = finalLogs.slice(startIndex, startIndex + limit);
+    if (extension) {
+      const ext = String(extension).toLowerCase();
+      finalLogs = finalLogs.filter(log =>
+        (log.extension || '').toLowerCase().includes(ext)
+      );
+    }
+
+    if (callType) {
+      finalLogs = finalLogs.filter(log => log.callType === callType);
+    }
+
+    if (stateCode) {
+      finalLogs = finalLogs.filter(log => String(log.stateCode || '') === String(stateCode));
+    }
+
+    if (typeof minDurationSec === 'number') {
+      finalLogs = finalLogs.filter(log => (log.durationSeconds || 0) >= minDurationSec);
+    }
+    if (typeof maxDurationSec === 'number') {
+      finalLogs = finalLogs.filter(log => (log.durationSeconds || 0) <= maxDurationSec);
+    }
+
+    if (typeof minCost === 'number') {
+      finalLogs = finalLogs.filter(log => (Number.isFinite(log.cost) ? log.cost : 0) >= minCost);
+    }
+    if (typeof maxCost === 'number') {
+      finalLogs = finalLogs.filter(log => (Number.isFinite(log.cost) ? log.cost : 0) <= maxCost);
+    }
+
+    // Use database totalCount for pagination, but return filtered results
+    const totalPages = Math.ceil(totalCount / limit);
+    const paginatedLogs = finalLogs; // Already paginated by database query
 
 
     // CSV export handling
@@ -361,7 +396,7 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
       pagination: {
         currentPage: page,
         totalPages: totalPages,
-        totalCount: finalTotalCount,
+        totalCount: totalCount,
         limit,
         hasNextPage: page < totalPages,
         hasPrevPage: page > 1
