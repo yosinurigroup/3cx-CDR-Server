@@ -32,6 +32,11 @@ app.use(cors({
       return callback(null, true);
     }
     
+    // Explicitly allow localhost:3000 for development
+    if (origin === 'http://localhost:3000') {
+      return callback(null, true);
+    }
+    
     const hostname = new URL(origin).hostname;
     // Allow *.vercel.app client domains (preview and prod)
     if (/\.vercel\.app$/.test(hostname)) {

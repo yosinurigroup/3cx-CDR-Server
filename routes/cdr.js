@@ -12,8 +12,14 @@ const querySchema = Joi.object({
   sortBy: Joi.string().valid('startTime', 'duration', 'cost', 'fromNumber', 'toNumber', 'historyId', 'durationSeconds').default('startTime'),
   sortOrder: Joi.string().valid('asc', 'desc').default('desc'),
   search: Joi.string().allow('').optional(),
-  dateFrom: Joi.date().optional(),
-  dateTo: Joi.date().optional(),
+  dateFrom: Joi.alternatives().try(
+    Joi.date(),
+    Joi.string().isoDate()
+  ).optional(),
+  dateTo: Joi.alternatives().try(
+    Joi.date(),
+    Joi.string().isoDate()
+  ).optional(),
   callType: Joi.string().valid('incoming', 'outgoing', 'internal').optional(),
   status: Joi.string().valid('answered', 'unanswered', 'redirected', 'waiting').optional(),
   terminationReason: Joi.string().optional(),
@@ -72,11 +78,43 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
     // Build query using actual database field names
     const query = {};
 
-    // Date range filter
+    // Date range filter - handle string dates in database format "2025/09/08 15:43:15"
     if (dateFrom || dateTo) {
       query['time-start'] = {};
-      if (dateFrom) query['time-start'].$gte = new Date(dateFrom);
-      if (dateTo) query['time-start'].$lte = new Date(dateTo);
+      if (dateFrom) {
+        try {
+          const fromDate = new Date(dateFrom);
+          if (!isNaN(fromDate.getTime())) {
+            // Convert to database string format: "YYYY/MM/DD HH:mm:ss"
+            const fromStr = fromDate.getFullYear() + '/' +
+                           String(fromDate.getMonth() + 1).padStart(2, '0') + '/' +
+                           String(fromDate.getDate()).padStart(2, '0') + ' ' +
+                           String(fromDate.getHours()).padStart(2, '0') + ':' +
+                           String(fromDate.getMinutes()).padStart(2, '0') + ':' +
+                           String(fromDate.getSeconds()).padStart(2, '0');
+            query['time-start'].$gte = fromStr;
+          }
+        } catch (error) {
+          console.warn('Invalid dateFrom format:', dateFrom);
+        }
+      }
+      if (dateTo) {
+        try {
+          const toDate = new Date(dateTo);
+          if (!isNaN(toDate.getTime())) {
+            // Convert to database string format: "YYYY/MM/DD HH:mm:ss"
+            const toStr = toDate.getFullYear() + '/' +
+                         String(toDate.getMonth() + 1).padStart(2, '0') + '/' +
+                         String(toDate.getDate()).padStart(2, '0') + ' ' +
+                         String(toDate.getHours()).padStart(2, '0') + ':' +
+                         String(toDate.getMinutes()).padStart(2, '0') + ':' +
+                         String(toDate.getSeconds()).padStart(2, '0');
+            query['time-start'].$lte = toStr;
+          }
+        } catch (error) {
+          console.warn('Invalid dateTo format:', dateTo);
+        }
+      }
     }
 
     // Filter by call type - we'll filter after transformation since it's derived from fromNumber
@@ -126,49 +164,97 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
 
     const isExport = String(req.query.export || '').toLowerCase() === 'true';
 
-    // Execute query
-    const rawCallLogs = await CDR.find(query)
+    // TURBO MODE: Get total count first for accurate pagination
+    const totalCount = await CDR.countDocuments(query);
+    
+    // Execute query with turbo-fast optimizations and smart pagination
+    const rawCallLogs = await CDR.find(query, {
+      // Only select fields we actually need for better performance
+      'historyid': 1,
+      'callid': 1,
+      'call-id': 1,
+      'time-start': 1,
+      'time-end': 1,
+      'duration': 1,
+      'from-no': 1,
+      'to-no': 1,
+      'reason-terminated': 1,
+      'bill-cost': 1,
+      'dial-no': 1,
+      'from-dn': 1,
+      'from-type': 1,
+      'to-type': 1,
+      'final-type': 1,
+      'from-dispname': 1,
+      'to-dispname': 1,
+      'final-dispname': 1,
+      'chain': 1,
+      'missed-queue-calls': 1,
+      'raw_stream': 1,
+      'time-answered': 1
+    })
       .sort(sort)
-      .limit(isExport ? 10000 : 20000) // Fetch a large set for in-memory filtering, or cap for export
-      .lean();
+      .skip(skip)
+      .limit(limit)
+      .lean()
+      .allowDiskUse(true)
+      .maxTimeMS(30000);
 
-    // Transform raw data to expected frontend format
+    // Turbo-fast data transformation with optimized field access
     const callLogs = rawCallLogs.map(log => {
-      const fromNumber = log['from-no'] || log.fromNumber || '';
-      const toNumber = log['to-no'] || log.toNumber || '';
-      const callType = determineCallType(log['from-type'], log['to-type'], fromNumber);
+      const fromNumber = log['from-no'] || '';
+      const toNumber = log['to-no'] || '';
+      const isOutgoing = fromNumber.startsWith('Ext.');
+      const callType = isOutgoing ? 'outgoing' : (/^\+?\d/.test(fromNumber) ? 'incoming' : 'outgoing');
       
       return {
         _id: log._id,
-        historyId: log.historyid || log.historyId || '',
-        callId: log['callid'] || log['call-id'] || log.callId || '',
-        startTime: log['time-start'] || log.startTime || '',
-        endTime: log['time-end'] || log.endTime || '',
+        historyId: log.historyid || '',
+        callId: log['callid'] || log['call-id'] || '',
+        startTime: log['time-start'] || '',
+        endTime: log['time-end'] || '',
         duration: log.duration || '',
-        durationSeconds: calculateDurationSeconds(log.duration, log['time-start'], log['time-end']),
+        durationSeconds: fastCalculateDuration(log.duration),
         fromNumber,
         toNumber,
-        terminationReason: log['reason-terminated'] || log.terminationReason || '',
-        cost: parseFloat(log['bill-cost'] || log.cost || 0),
+        terminationReason: log['reason-terminated'] || '',
+        cost: parseFloat(log['bill-cost'] || 0),
         callType,
-        trunkNumber: log['dial-no'] || log.trunkNumber || '',
-        // STATE: Only for outgoing calls, first 2 digits of TO number
-        stateCode: callType === 'outgoing' ? extractStateCode(toNumber) : '',
-        // AREA CODE: Only for outgoing calls, digits 3-5 of TO number (after state)
-        areaCode: callType === 'outgoing' ? extractAreaCode(toNumber) : '',
-        extension: log['from-dn'] || log.extension || '',
-        status: determineCallStatus(log['time-answered'], log['reason-terminated']),
-        // Additional raw/metadata fields requested for column selection
-        chain: log['chain'] || log.chain || '',
-        fromType: log['from-type'] || log.fromType || '',
-        finalType: log['final-type'] || log['to-type'] || log.finalType || '',
-        fromDispname: log['from-dispname'] || log.fromDispname || '',
-        toDispname: log['to-dispname'] || log.toDispname || '',
-        finalDispname: log['final-dispname'] || log.finalDispname || '',
-        missedQueueCalls: log['missed-queue-calls'] || log.missedQueueCalls || 0,
-        rawStream: log['raw_stream'] || log.raw_stream || log.rawStream || ''
+        trunkNumber: log['dial-no'] || '',
+        stateCode: isOutgoing ? fastExtractStateCode(toNumber) : '',
+        areaCode: isOutgoing ? fastExtractAreaCode(toNumber) : '',
+        extension: log['from-dn'] || '',
+        status: log['time-answered'] ? 'answered' : 'unanswered',
+        chain: log['chain'] || '',
+        fromType: log['from-type'] || '',
+        finalType: log['final-type'] || log['to-type'] || '',
+        fromDispname: log['from-dispname'] || '',
+        toDispname: log['to-dispname'] || '',
+        finalDispname: log['final-dispname'] || '',
+        missedQueueCalls: log['missed-queue-calls'] || 0,
+        rawStream: log['raw_stream'] || ''
       };
     });
+
+    // Optimized helper functions for speed
+    function fastCalculateDuration(duration) {
+      if (!duration || typeof duration !== 'string') return 0;
+      const parts = duration.split(':');
+      if (parts.length !== 3) return 0;
+      return parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseInt(parts[2]);
+    }
+
+    function fastExtractStateCode(phoneNumber) {
+      if (!phoneNumber) return '';
+      const cleaned = phoneNumber.replace(/\D/g, '');
+      return cleaned.length >= 2 ? cleaned.substring(0, 2) : '';
+    }
+
+    function fastExtractAreaCode(phoneNumber) {
+      if (!phoneNumber) return '';
+      const cleaned = phoneNumber.replace(/\D/g, '');
+      return cleaned.length >= 5 ? cleaned.substring(2, 5) : '';
+    }
 
     // Apply post-transformation filters
     let filteredCallLogs = callLogs;
@@ -226,67 +312,6 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
     const startIndex = (page - 1) * limit;
     const paginatedLogs = finalLogs.slice(startIndex, startIndex + limit);
 
-    // Helper function to calculate duration in seconds
-    function calculateDurationSeconds(duration, startTime, endTime) {
-      if (duration && duration !== '') {
-        const parts = duration.split(':');
-        if (parts.length === 3) {
-          return parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseInt(parts[2]);
-        }
-      }
-      if (startTime && endTime) {
-        return Math.floor((new Date(endTime) - new Date(startTime)) / 1000);
-      }
-      return 0;
-    }
-
-    // Helper function to determine call type based on FROM field
-    function determineCallType(fromType, toType, fromNumber) {
-      // Business rule: If FROM starts with "Ext." it's outgoing, if FROM is a number it's incoming
-      if (fromNumber && fromNumber.startsWith('Ext.')) {
-        return 'outgoing';
-      }
-      
-      // If FROM is a phone number (contains digits and doesn't start with Ext.), it's incoming
-      if (fromNumber && /^\+?\d/.test(fromNumber) && !fromNumber.startsWith('Ext.')) {
-        return 'incoming';
-      }
-      
-      // Fallback to original logic for edge cases
-      if (fromType === 'extension' && toType === 'external_line') return 'outgoing';
-      if (fromType === 'external_line' && toType === 'extension') return 'incoming';
-      if (fromType === 'extension' && toType === 'extension') return 'internal';
-      
-      return 'outgoing'; // default
-    }
-
-    // Helper function to determine call status
-    function determineCallStatus(timeAnswered, reasonTerminated) {
-      if (timeAnswered && timeAnswered !== '') return 'answered';
-      if (reasonTerminated === 'src_participant_terminated') return 'unanswered';
-      if (reasonTerminated === 'redirected') return 'redirected';
-      return 'unanswered'; // default
-    }
-
-    // Helper function to extract state code (first 2 digits)
-    function extractStateCode(phoneNumber) {
-      if (!phoneNumber) return '';
-      const cleaned = phoneNumber.replace(/\D/g, '');
-      if (cleaned.length >= 2) {
-        return cleaned.substring(0, 2);
-      }
-      return '';
-    }
-
-    // Helper function to extract area code (digits 3-5, after state code)
-    function extractAreaCode(phoneNumber) {
-      if (!phoneNumber) return '';
-      const cleaned = phoneNumber.replace(/\D/g, '');
-      if (cleaned.length >= 5) {
-        return cleaned.substring(2, 5);
-      }
-      return '';
-    }
 
     // CSV export handling
     if (isExport) {
@@ -336,7 +361,7 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
       pagination: {
         currentPage: page,
         totalPages: totalPages,
-        totalCount: totalCount,
+        totalCount: finalTotalCount,
         limit,
         hasNextPage: page < totalPages,
         hasPrevPage: page > 1
@@ -563,8 +588,14 @@ router.get('/area-codes', auth, checkPermission('viewCallLogs'), async (req, res
       sortOrder: Joi.string().valid('asc', 'desc').default('desc'),
       search: Joi.string().allow('').optional().default(''),
       state: Joi.string().allow('').optional(),
-      dateFrom: Joi.date().optional(),
-      dateTo: Joi.date().optional(),
+      dateFrom: Joi.alternatives().try(
+        Joi.date(),
+        Joi.string().isoDate()
+      ).optional(),
+      dateTo: Joi.alternatives().try(
+        Joi.date(),
+        Joi.string().isoDate()
+      ).optional(),
       collection: Joi.string().valid('cdrs_143.198.0.104', 'cdrs_167.71.120.52').optional().default(process.env.MONGODB_COLLECTION1)
     });
 
@@ -612,25 +643,75 @@ router.get('/area-codes', auth, checkPermission('viewCallLogs'), async (req, res
       callType: 'outgoing'
     };
 
-    // Date filtering
+    // Date filtering - use raw database field names
     if (dateFrom || dateTo) {
-      matchConditions.startTime = {};
-      if (dateFrom) matchConditions.startTime.$gte = new Date(dateFrom);
-      if (dateTo) matchConditions.startTime.$lte = new Date(dateTo);
+      matchConditions['time-start'] = {};
+      if (dateFrom) {
+        try {
+          const fromDate = new Date(dateFrom);
+          if (!isNaN(fromDate.getTime())) {
+            matchConditions['time-start'].$gte = fromDate;
+          }
+        } catch (error) {
+          console.warn('Invalid dateFrom format:', dateFrom);
+        }
+      }
+      if (dateTo) {
+        try {
+          const toDate = new Date(dateTo);
+          if (!isNaN(toDate.getTime())) {
+            matchConditions['time-start'].$lte = toDate;
+          }
+        } catch (error) {
+          console.warn('Invalid dateTo format:', dateTo);
+        }
+      }
     }
 
     console.log('🔍 Match conditions:', JSON.stringify(matchConditions, null, 2));
 
     // Robust aggregation pipeline that derives fields from raw CDR columns
     const pipeline = [
-      // Optional date filtering (match analytics behavior)
+      // Optional date filtering (handle string dates in database format)
       {
         $match: (() => {
           const q = {};
           if (dateFrom || dateTo) {
             q['time-start'] = {};
-            if (dateFrom) q['time-start'].$gte = new Date(dateFrom);
-            if (dateTo) q['time-start'].$lte = new Date(dateTo);
+            if (dateFrom) {
+              try {
+                const fromDate = new Date(dateFrom);
+                if (!isNaN(fromDate.getTime())) {
+                  // Convert to database string format: "YYYY/MM/DD HH:mm:ss"
+                  const fromStr = fromDate.getFullYear() + '/' +
+                                 String(fromDate.getMonth() + 1).padStart(2, '0') + '/' +
+                                 String(fromDate.getDate()).padStart(2, '0') + ' ' +
+                                 String(fromDate.getHours()).padStart(2, '0') + ':' +
+                                 String(fromDate.getMinutes()).padStart(2, '0') + ':' +
+                                 String(fromDate.getSeconds()).padStart(2, '0');
+                  q['time-start'].$gte = fromStr;
+                }
+              } catch (error) {
+                console.warn('Invalid dateFrom format:', dateFrom);
+              }
+            }
+            if (dateTo) {
+              try {
+                const toDate = new Date(dateTo);
+                if (!isNaN(toDate.getTime())) {
+                  // Convert to database string format: "YYYY/MM/DD HH:mm:ss"
+                  const toStr = toDate.getFullYear() + '/' +
+                               String(toDate.getMonth() + 1).padStart(2, '0') + '/' +
+                               String(toDate.getDate()).padStart(2, '0') + ' ' +
+                               String(toDate.getHours()).padStart(2, '0') + ':' +
+                               String(toDate.getMinutes()).padStart(2, '0') + ':' +
+                               String(toDate.getSeconds()).padStart(2, '0');
+                  q['time-start'].$lte = toStr;
+                }
+              } catch (error) {
+                console.warn('Invalid dateTo format:', dateTo);
+              }
+            }
           }
           return q;
         })()
@@ -835,8 +916,8 @@ router.get('/area-codes', auth, checkPermission('viewCallLogs'), async (req, res
     });
 
     // Pagination
-    const totalCount = areaCodes.length;
-    const totalPages = Math.ceil(totalCount / limit);
+    const areaCodeCount = areaCodes.length;
+    const totalPages = Math.ceil(areaCodeCount / limit);
     const startIndex = (page - 1) * limit;
     const paginated = areaCodes.slice(startIndex, startIndex + limit);
 
@@ -851,7 +932,7 @@ router.get('/area-codes', auth, checkPermission('viewCallLogs'), async (req, res
       pagination: {
         currentPage: page,
         totalPages,
-        totalCount,
+        totalCount: areaCodeCount,
         limit,
         hasNextPage: page < totalPages,
         hasPrevPage: page > 1
@@ -864,6 +945,38 @@ router.get('/area-codes', auth, checkPermission('viewCallLogs'), async (req, res
       error: 'Server error while fetching area codes',
       details: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
+  }
+});
+
+// Debug endpoint to check date ranges in database
+router.get('/debug/date-range', auth, async (req, res) => {
+  try {
+    const { collection } = req.query;
+    const CDR = getCDRModel(collection);
+    
+    // Get min and max dates from the database
+    const minDate = await CDR.findOne({}, { 'time-start': 1 }).sort({ 'time-start': 1 }).lean();
+    const maxDate = await CDR.findOne({}, { 'time-start': 1 }).sort({ 'time-start': -1 }).lean();
+    
+    // Get a few sample records to see the actual data structure
+    const samples = await CDR.find({}, { 'time-start': 1, 'from-no': 1, 'to-no': 1 }).limit(5).lean();
+    
+    res.json({
+      success: true,
+      dateRange: {
+        min: minDate ? minDate['time-start'] : null,
+        max: maxDate ? maxDate['time-start'] : null
+      },
+      samples: samples.map(s => ({
+        timeStart: s['time-start'],
+        from: s['from-no'],
+        to: s['to-no']
+      })),
+      totalRecords: await CDR.countDocuments({})
+    });
+  } catch (error) {
+    console.error('Debug date range error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 

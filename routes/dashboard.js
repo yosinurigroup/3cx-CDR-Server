@@ -28,12 +28,44 @@ router.get('/stats', auth, checkPermission('viewAnalytics'), async (req, res) =>
     console.log(`🚀 Processing dashboard stats for collection: ${collection}`);
     const startTime = Date.now();
 
-    // Build dynamic stages for powerful filtering
+    // Build dynamic stages for powerful filtering - handle string dates in database format
     const dateMatch = {};
     if (dateFrom || dateTo) {
       dateMatch['time-start'] = {};
-      if (dateFrom) dateMatch['time-start'].$gte = new Date(dateFrom);
-      if (dateTo) dateMatch['time-start'].$lte = new Date(dateTo);
+      if (dateFrom) {
+        try {
+          const fromDate = new Date(dateFrom);
+          if (!isNaN(fromDate.getTime())) {
+            // Convert to database string format: "YYYY/MM/DD HH:mm:ss"
+            const fromStr = fromDate.getFullYear() + '/' +
+                           String(fromDate.getMonth() + 1).padStart(2, '0') + '/' +
+                           String(fromDate.getDate()).padStart(2, '0') + ' ' +
+                           String(fromDate.getHours()).padStart(2, '0') + ':' +
+                           String(fromDate.getMinutes()).padStart(2, '0') + ':' +
+                           String(fromDate.getSeconds()).padStart(2, '0');
+            dateMatch['time-start'].$gte = fromStr;
+          }
+        } catch (error) {
+          console.warn('Invalid dateFrom format:', dateFrom);
+        }
+      }
+      if (dateTo) {
+        try {
+          const toDate = new Date(dateTo);
+          if (!isNaN(toDate.getTime())) {
+            // Convert to database string format: "YYYY/MM/DD HH:mm:ss"
+            const toStr = toDate.getFullYear() + '/' +
+                         String(toDate.getMonth() + 1).padStart(2, '0') + '/' +
+                         String(toDate.getDate()).padStart(2, '0') + ' ' +
+                         String(toDate.getHours()).padStart(2, '0') + ':' +
+                         String(toDate.getMinutes()).padStart(2, '0') + ':' +
+                         String(toDate.getSeconds()).padStart(2, '0');
+            dateMatch['time-start'].$lte = toStr;
+          }
+        } catch (error) {
+          console.warn('Invalid dateTo format:', dateTo);
+        }
+      }
     }
 
     const derivedMatch = {};
@@ -49,8 +81,26 @@ router.get('/stats', auth, checkPermission('viewAnalytics'), async (req, res) =>
     const timeStartRangeMatch = {};
     if (dateFrom || dateTo) {
       timeStartRangeMatch.timeStartDate = {};
-      if (dateFrom) timeStartRangeMatch.timeStartDate.$gte = new Date(dateFrom);
-      if (dateTo) timeStartRangeMatch.timeStartDate.$lte = new Date(dateTo);
+      if (dateFrom) {
+        try {
+          const fromDate = new Date(dateFrom);
+          if (!isNaN(fromDate.getTime())) {
+            timeStartRangeMatch.timeStartDate.$gte = fromDate;
+          }
+        } catch (error) {
+          console.warn('Invalid dateFrom format:', dateFrom);
+        }
+      }
+      if (dateTo) {
+        try {
+          const toDate = new Date(dateTo);
+          if (!isNaN(toDate.getTime())) {
+            timeStartRangeMatch.timeStartDate.$lte = toDate;
+          }
+        } catch (error) {
+          console.warn('Invalid dateTo format:', dateTo);
+        }
+      }
     }
 
     // MAGIC AGGREGATION PIPELINE 🎯
