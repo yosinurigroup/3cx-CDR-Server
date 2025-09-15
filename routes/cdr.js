@@ -305,8 +305,8 @@ router.get('/call-logs', auth, checkPermission('viewCallLogs'), async (req, res)
     // Determine which dataset to use for pagination and response
     const isFiltered = areaCode || extension || callType;
     const finalLogs = isFiltered ? filteredCallLogs : callLogs;
-    const totalCount = finalLogs.length;
-    const totalPages = Math.ceil(totalCount / limit);
+    const finalTotalCount = finalLogs.length;
+    const totalPages = Math.ceil(finalTotalCount / limit);
 
     // Apply pagination to the final dataset
     const startIndex = (page - 1) * limit;
